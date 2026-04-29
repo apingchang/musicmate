@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# PyInstaller
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local config (contains sensitive paths)
+config/
+logs/
+cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Audio recordings / large media
+*.mp3
+*.wav
+*.ogg
+*.flac
+
+# OMR cache
+*.musicxml
