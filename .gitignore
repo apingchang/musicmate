@@ -37,4 +37,4 @@ Thumbs.db
 *.flac
 
 # OMR cache
-*.musicxml
+*.musicxml.sync.ffs_db

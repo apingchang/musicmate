@@ -137,8 +137,35 @@
 
 ---
 
-*本文件由夥計維護，记录所有專案相關討論。*
-
 #### Step 5（更新）：音色選擇新增
 - **額外音色**：豎笛（Clarinet）、小喇叭（Trumpet）
 - 來自 William 的要求
+
+### 2026-05-08
+
+#### GitHub 版控確認啟用
+- **Repo URL**：`https://github.com/apingchang/musicmate`
+- **Repo 已存在**，初始 commit 已有基本專案結構（src/、docs/、scripts/、tests/）
+- 確認 `docs/` 和 `scripts/` 有未追蹤檔案尚未 commit
+
+#### 開發環境確認
+- **正式開發環境**：Windows 11 Host OS + PyCharm Community
+- **驗證環境**：Ubuntu（VirtualBox）
+- **兩地共同維護同一個 GitHub repo**，透過 push/pull 同步
+- **Python 版本**：3.12+
+
+#### PyCharm 設定完成
+- William 在 Windows 上成功 Clone 並開啟專案
+- 設定 `src/` 為 Sources Root
+- 安裝依賴：`pip install -r requirements.txt`
+- **基本視窗成功顯示**，PyQt6 正常運作 ✅
+
+#### 跨平台開發原則（確立的共識）
+- Windows 和 Linux 共用同一個 repo、同一份 source code
+- 平台專屬程式碼寫在 `if sys.platform == "win32"` / `"linux"` 判斷裡
+- requirements.txt 可拆分成 `requirements-win.txt` / `requirements-linux.txt`
+- `.idea/` 設定檔存在各自本機，透過 `.gitignore` 排除
+
+---
+
+*本文件由夥計維護，记录所有專案相關討論。*
