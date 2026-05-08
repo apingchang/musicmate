@@ -1,4 +1,4 @@
-"""MusicMate 練琴寶 - 主程式進入點"""
+""" 2026 MusicMate 練琴寶 - 主程式進入點"""
 
 import sys
 from PyQt6.QtWidgets import QApplication
