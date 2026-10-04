@@ -96,8 +96,37 @@ def main():
     print(f"雲端建置已自動觸發：")
     print(f"👉 Actions 進度：https://github.com/apingchang/musicmate/actions")
     print(f"👉 Releases 下載：https://github.com/apingchang/musicmate/releases")
-    print("=" * 50 + "\n")
+    print("=" * 50)
+
+    # 5. 若有 --sync 參數或預設直接同步
+    if "--no-sync" not in sys.argv:
+        print("\n⏳ 正在等待 GitHub Actions 雲端雙平台建置完成...")
+        import urllib.request, json, time
+        api_runs = "https://api.github.com/repos/apingchang/musicmate/actions/runs"
+        success = False
+        for _ in range(60):  # 最多等待 10 分鐘
+            time.sleep(10)
+            try:
+                req = urllib.request.Request(api_runs, headers={"User-Agent": "MusicMate-Release"})
+                with urllib.request.urlopen(req) as resp:
+                    runs = json.loads(resp.read().decode()).get("workflow_runs", [])
+                    matched = [r for r in runs if r.get("head_branch") == target_tag]
+                    if matched and matched[0].get("status") == "completed":
+                        if matched[0].get("conclusion") == "success":
+                            print(f"\n✓ 雲端建置成功！即將自動同步至本地 release/ 資料夾...")
+                            success = True
+                        else:
+                            print(f"\n⚠️ 雲端建置狀態：{matched[0].get('conclusion')}，請檢查 GitHub Actions。")
+                        break
+            except Exception:
+                pass
+            print(".", end="", flush=True)
+
+        if success:
+            sync_script = repo_root / "scripts" / "sync_release.py"
+            subprocess.run([sys.executable, str(sync_script)])
 
 
 if __name__ == "__main__":
     main()
+
