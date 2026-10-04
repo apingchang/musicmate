@@ -35,7 +35,7 @@ def main():
     if win_asset:
         win_zip = release_dir / win_asset["name"]
         print(f"正在下載 Windows 執行檔 ({win_asset['size'] // (1024*1024)} MB)...")
-        subprocess.run(["curl", "-C", "-", "-L", "-o", str(win_zip), win_asset["browser_download_url"]], check=True)
+        subprocess.run(["curl", "--http1.1", "--retry", "3", "-C", "-", "-L", "-o", str(win_zip), win_asset["browser_download_url"]], check=True)
         print("正在解壓縮 Windows 執行檔...")
         import zipfile
         with zipfile.ZipFile(win_zip, 'r') as z:
@@ -46,8 +46,9 @@ def main():
     if ubuntu_asset:
         ubuntu_tar = release_dir / ubuntu_asset["name"]
         print(f"正在下載 Ubuntu 執行檔 ({ubuntu_asset['size'] // (1024*1024)} MB)...")
-        subprocess.run(["curl", "-C", "-", "-L", "-o", str(ubuntu_tar), ubuntu_asset["browser_download_url"]], check=True)
+        subprocess.run(["curl", "--http1.1", "--retry", "3", "-C", "-", "-L", "-o", str(ubuntu_tar), ubuntu_asset["browser_download_url"]], check=True)
         print("正在解壓縮 Ubuntu 執行檔...")
+
         import tarfile
         with tarfile.open(ubuntu_tar, 'r:gz') as t:
             t.extractall(release_dir)

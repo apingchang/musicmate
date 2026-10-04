@@ -106,17 +106,56 @@ class Tuner:
         self._error_callback = callback
 
     def start(self) -> bool:
-        """啟動麥克風即時收音"""
+        """啟動麥克風即時收音（Linux 優先使用 arecord 原生串流，Windows 使用 sounddevice）"""
         if self._is_listening:
             return True
 
+        import platform, shutil, subprocess, threading
+
+        # Linux 平台：若有 arecord，優先使用原生 ALSA 串流（零外部 C 依賴，保證穩定）
+        if platform.system() == "Linux" and shutil.which("arecord") is not None:
+            return self._start_arecord_stream()
+
+        # Windows 或其他平台：使用 sounddevice / PortAudio
+        return self._start_sounddevice_stream()
+
+    def _start_arecord_stream(self) -> bool:
+        """Linux 原生 ALSA 麥克風串流"""
+        import subprocess, threading
+        try:
+            cmd = ['arecord', '-f', 'S16_LE', '-r', str(self._sample_rate), '-c', '1', '-q', '-t', 'raw']
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._is_listening = True
+
+            def arecord_loop():
+                bytes_to_read = self._buffer_size * 2  # 16-bit mono PCM
+                while self._is_listening and self._proc and self._proc.poll() is None:
+                    try:
+                        raw = self._proc.stdout.read(bytes_to_read)
+                        if not raw or len(raw) < bytes_to_read:
+                            continue
+                        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                        self._process_audio_frame(samples)
+                    except Exception:
+                        pass
+
+            self._thread = threading.Thread(target=arecord_loop, daemon=True)
+            self._thread.start()
+            return True
+        except Exception as e:
+            self._is_listening = False
+            if self._error_callback:
+                self._error_callback(f"Linux 麥克風啟動失敗：{str(e)}")
+            return False
+
+    def _start_sounddevice_stream(self) -> bool:
+        """Windows / 通用 sounddevice 麥克風串流"""
         if sd is None:
             if self._error_callback:
                 self._error_callback("系統未安裝 sounddevice 或音訊驅動不可用")
             return False
 
         try:
-            # 檢查是否有可用的音訊輸入裝置
             devices = sd.query_devices()
             input_devices = [d for d in devices if d.get('max_input_channels', 0) > 0]
             if not input_devices:
@@ -129,8 +168,11 @@ class Tuner:
             def audio_callback(indata, frames, time_info, status):
                 if not self._is_listening:
                     return
-                audio_data = indata[:, 0]
-                self._process_audio_frame(audio_data)
+                try:
+                    audio_data = indata[:, 0]
+                    self._process_audio_frame(audio_data)
+                except Exception:
+                    pass
 
             self._stream = sd.InputStream(
                 samplerate=self._sample_rate,
@@ -158,13 +200,22 @@ class Tuner:
     def stop(self):
         """停止麥克風收音"""
         self._is_listening = False
-        if self._stream:
+        if hasattr(self, '_proc') and self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=0.3)
+            except Exception:
+                pass
+            self._proc = None
+
+        if hasattr(self, '_stream') and self._stream:
             try:
                 self._stream.stop()
                 self._stream.close()
             except Exception:
                 pass
             self._stream = None
+
 
     def _process_audio_frame(self, frame: np.ndarray):
         """處理單一音訊緩衝區"""

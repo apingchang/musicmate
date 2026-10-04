@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """MusicMate 本地端打包腳本
 
-使用 PyInstaller 將 MusicMate 打包為單一二進位執行檔：
-- Windows: dist/MusicMate.exe
-- Linux/Ubuntu: dist/MusicMate
+在本地快速打包為二進位執行檔，並自動放置到 release/ 資料夾：
+- Linux/Ubuntu: release/MusicMate
+- Windows: release/MusicMate.exe
 """
 
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,17 +18,23 @@ def main():
     repo_root = Path(__file__).resolve().parent.parent
     os.chdir(repo_root)
 
-    print(f"=== MusicMate 打包流程 ===")
+    print(f"=== MusicMate 本地打包流程 ===")
     print(f"作業系統：{platform.system()} ({platform.machine()})")
     print(f"專案目錄：{repo_root}")
 
-    # 檢查是否安裝 pyinstaller
-    try:
-        import PyInstaller
-        print(f"PyInstaller 版本：{PyInstaller.__version__}")
-    except ImportError:
-        print("未安裝 PyInstaller，正在嘗試安裝...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller>=6.0.0"])
+    # 檢查是否有 .venv
+    venv_python = repo_root / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = repo_root / ".venv" / "Scripts" / "python.exe"
+    
+    python_bin = str(venv_python) if venv_python.exists() else sys.executable
+    print(f"使用 Python 環境：{python_bin}")
+
+    # 檢查 pyinstaller
+    check_pi = subprocess.run([python_bin, "-m", "PyInstaller", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if check_pi.returncode != 0:
+        print("未安裝 PyInstaller，正在安裝依賴...")
+        subprocess.check_call([python_bin, "-m", "pip", "install", "-r", "requirements.txt"])
 
     spec_file = repo_root / "musicmate.spec"
     if not spec_file.exists():
@@ -35,7 +42,7 @@ def main():
         sys.exit(1)
 
     cmd = [
-        sys.executable,
+        python_bin,
         "-m",
         "PyInstaller",
         "--clean",
@@ -43,18 +50,27 @@ def main():
         str(spec_file)
     ]
 
-    print(f"\n執行指令：{' '.join(cmd)}")
+    print(f"\n執行打包指令：{' '.join(cmd)}")
     result = subprocess.run(cmd)
 
     if result.returncode == 0:
         exe_ext = ".exe" if platform.system() == "Windows" else ""
-        output_file = repo_root / "dist" / f"MusicMate{exe_ext}"
-        if output_file.exists():
-            size_mb = output_file.stat().st_size / (1024 * 1024)
-            print("\n🎉 打包成功！")
-            print(f"產出檔案：{output_file} ({size_mb:.2f} MB)")
+        built_file = repo_root / "dist" / f"MusicMate{exe_ext}"
+        release_dir = repo_root / "release"
+        release_dir.mkdir(exist_ok=True)
+        target_file = release_dir / f"MusicMate{exe_ext}"
+
+        if built_file.exists():
+            shutil.copy2(built_file, target_file)
+            if platform.system() != "Windows":
+                os.chmod(target_file, 0o755)
+            size_mb = target_file.stat().st_size / (1024 * 1024)
+            print("\n" + "=" * 50)
+            print("🎉 本地打包成功！")
+            print(f"輸出目標：{target_file} ({size_mb:.2f} MB)")
+            print("=" * 50 + "\n")
         else:
-            print(f"\n編譯完成，請檢查 dist/ 目錄。")
+            print(f"\n編譯完成，但未找到產出檔案：{built_file}")
     else:
         print("\n❌ 打包失敗，請檢視上方錯誤訊息。")
         sys.exit(result.returncode)

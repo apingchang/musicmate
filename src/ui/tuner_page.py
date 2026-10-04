@@ -205,12 +205,30 @@ class TunerPage(QWidget):
             diff_sign = f"+{t_diff:.1f}" if t_diff > 0 else f"{t_diff:.1f}"
             self.target_label.setText(f"目前對應：{t_name}（標準 {t_freq:.1f} Hz，相差 {diff_sign} Hz）")
 
+    def _reset_mic_ui(self):
+        """安全重設按鈕與狀態顯示（絕不觸發 toggle）"""
+        self.mic_btn.setText("🎤 啟動麥克風")
+        self.mic_btn.setStyleSheet(
+            "QPushButton { background-color: #0078D4; color: white; "
+            "font-size: 18px; font-weight: bold; border-radius: 8px; }"
+            "QPushButton:hover { background-color: #106EBE; }"
+        )
+        self.status_tip.setText("狀態：麥克風已就緒（點擊啟動開始調音）")
+        self.status_tip.setStyleSheet("font-size: 12px; color: #888;")
+        self.note_label.setText("--")
+        self.note_label.setStyleSheet("font-size: 72px; font-weight: bold; color: #333333;")
+        self.cents_label.setText("麥克風已關閉")
+        self.meter_widget.set_cents(0, False, False)
+
     def _handle_ui_error(self, message: str):
-        """處理收音錯誤"""
-        self._on_mic_toggle()  # 復原按鈕狀態
+        """處理收音錯誤，安全重設 UI 並提醒用戶，避免死鎖遞迴"""
+        if self.tuner.is_listening:
+            self.tuner.stop()
+        self._reset_mic_ui()
         self.status_tip.setText(f"錯誤：{message}")
         self.status_tip.setStyleSheet("font-size: 12px; color: #d32f2f; font-weight: bold;")
-        QMessageBox.warning(self, "麥克風存取提示", f"{message}\n\n請確認麥克風已接上，且系統隱私設定已允許存取麥克風。")
+        QMessageBox.warning(self, "麥克風存取提示", f"{message}\n\n請確認麥克風已接上，且系統已允許存取麥克風。")
+
 
     def _set_ref_a4(self, freq: float):
         self._ref_a4 = freq
