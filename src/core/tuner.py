@@ -1,30 +1,76 @@
 """調音器核心邏輯
 
-音高偵測演算法：FFT + 自相關（Autocorrelation）混合
-參考音 A4 預設 440 Hz（可調 430~450 Hz）
+高精度音高偵測與跨平台麥克風安全收音：
+- 音高偵測演算法：Normalized Autocorrelation（自相關）搭配拋物線次取樣插值
+- 支援靜音閘（RMS 門檻過濾環境噪音）
+- 參考音 A4 可自訂（430~450 Hz，預設 440 Hz）
+- 輸出：音名、八度、Cents 偏差（-50 ~ +50）、頻率（Hz）
+- 支援多種樂器標準音對應（吉他、烏克麗麗、小提琴、大提琴等）
+- 跨平台 PortAudio / sounddevice 容錯與安全串流管理
 """
 
+import math
+from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
+
 try:
     import sounddevice as sd
 except Exception:
     sd = None
-from typing import Callable, Optional
-
-
-
-# TODO: 實作 FFT + 自相關音高偵測
-# TODO: 實作麥克風收音串流
 
 
 class Tuner:
-    """調音器引擎"""
+    """跨平台調音器核心引擎"""
 
-    def __init__(self):
+    NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+    # 常見樂器預設弦音高 (Hz 與 音名八度)
+    INSTRUMENTS_PRESETS = {
+        "吉他": [
+            ("6弦 (E2)", 82.41),
+            ("5弦 (A2)", 110.00),
+            ("4弦 (D3)", 146.83),
+            ("3弦 (G3)", 196.00),
+            ("2弦 (B3)", 246.94),
+            ("1弦 (E4)", 329.63),
+        ],
+        "烏克麗麗": [
+            ("4弦 (G4)", 392.00),
+            ("3弦 (C4)", 261.63),
+            ("2弦 (E4)", 329.63),
+            ("1弦 (A4)", 440.00),
+        ],
+        "小提琴": [
+            ("4弦 (G3)", 196.00),
+            ("3弦 (D4)", 293.66),
+            ("2弦 (A4)", 440.00),
+            ("1弦 (E5)", 659.25),
+        ],
+        "大提琴": [
+            ("4弦 (C2)", 65.41),
+            ("3弦 (G2)", 97.99),
+            ("2弦 (D3)", 146.83),
+            ("1弦 (A3)", 220.00),
+        ],
+        "長笛": [
+            ("最低音 (C4)", 261.63),
+            ("基準音 (A4)", 440.00),
+        ],
+        "鋼琴": [
+            ("全音域", 0.0),
+        ],
+    }
+
+    def __init__(self, sample_rate: int = 44100, buffer_size: int = 4096):
+        self._sample_rate = sample_rate
+        self._buffer_size = buffer_size
         self._ref_a4 = 440.0  # Hz
+        self._rms_threshold = 0.008  # 靜音門檻
         self._is_listening = False
-        self._stream: Optional[sd.InputStream] = None
-        self._pitch_callback: Optional[Callable[[str, float, float], None]] = None
+        self._stream = None
+        self._pitch_callback: Optional[Callable[[str, int, float, float, bool], None]] = None
+        self._error_callback: Optional[Callable[[str], None]] = None
+        self._current_instrument = "吉他"
 
     @property
     def ref_a4(self) -> float:
@@ -32,60 +78,214 @@ class Tuner:
 
     @ref_a4.setter
     def ref_a4(self, value: float):
-        self._ref_a4 = max(430.0, min(450.0, value))
+        self._ref_a4 = max(430.0, min(450.0, float(value)))
 
-    def set_pitch_callback(self, callback: Callable[[str, float, float], None]):
+    @property
+    def is_listening(self) -> bool:
+        return self._is_listening
+
+    @property
+    def instrument(self) -> str:
+        return self._current_instrument
+
+    @instrument.setter
+    def instrument(self, name: str):
+        if name in self.INSTRUMENTS_PRESETS:
+            self._current_instrument = name
+
+    def set_pitch_callback(self, callback: Callable[[str, int, float, float, bool], None]):
         """設定偵測到音高時的回調
-        callback(note_name, cents, frequency)
+        callback(note_name, octave, cents, frequency, is_in_tune)
         """
         self._pitch_callback = callback
 
-    def start(self):
-        """啟動麥克風收音"""
+    def set_error_callback(self, callback: Callable[[str], None]):
+        """設定麥克風發生錯誤時的回調
+        callback(error_message)
+        """
+        self._error_callback = callback
+
+    def start(self) -> bool:
+        """啟動麥克風即時收音"""
         if self._is_listening:
-            return
-        self._is_listening = True
+            return True
 
-        def audio_callback(indata, frames, time, status):
-            if status:
-                print(f"Audio input error: {status}")
-                return
-            # TODO: 實作音高偵測
-            pass
+        if sd is None:
+            if self._error_callback:
+                self._error_callback("系統未安裝 sounddevice 或音訊驅動不可用")
+            return False
 
-        self._stream = sd.InputStream(
-            samplerate=44100,
-            channels=1,
-            dtype='float32',
-            blocksize=4096,
-            callback=audio_callback
-        )
-        self._stream.start()
+        try:
+            # 檢查是否有可用的音訊輸入裝置
+            devices = sd.query_devices()
+            input_devices = [d for d in devices if d.get('max_input_channels', 0) > 0]
+            if not input_devices:
+                if self._error_callback:
+                    self._error_callback("找不到可用的麥克風輸入裝置")
+                return False
+
+            self._is_listening = True
+
+            def audio_callback(indata, frames, time_info, status):
+                if not self._is_listening:
+                    return
+                audio_data = indata[:, 0]
+                self._process_audio_frame(audio_data)
+
+            self._stream = sd.InputStream(
+                samplerate=self._sample_rate,
+                channels=1,
+                dtype='float32',
+                blocksize=self._buffer_size,
+                callback=audio_callback
+            )
+            self._stream.start()
+            return True
+
+        except Exception as e:
+            self._is_listening = False
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            if self._error_callback:
+                self._error_callback(f"無法存取麥克風：{str(e)}")
+            return False
 
     def stop(self):
-        """停止收音"""
+        """停止麥克風收音"""
         self._is_listening = False
         if self._stream:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
             self._stream = None
 
-    @staticmethod
-    def frequency_to_note(freq: float, ref_a4: float = 440.0) -> tuple:
-        """將頻率轉換為音名與 cents 偏差
-        返回 (note_name, cents)
-        """
+    def _process_audio_frame(self, frame: np.ndarray):
+        """處理單一音訊緩衝區"""
+        # 計算 RMS 音量
+        rms = float(np.sqrt(np.mean(frame ** 2)))
+        if rms < self._rms_threshold:
+            # 靜音狀態
+            if self._pitch_callback:
+                self._pitch_callback("--", 0, 0.0, 0.0, False)
+            return
+
+        # 計算基頻
+        freq = self.detect_pitch(frame, self._sample_rate)
+        if freq is None or freq < 30.0 or freq > 2500.0:
+            if self._pitch_callback:
+                self._pitch_callback("--", 0, 0.0, 0.0, False)
+            return
+
+        # 轉換為音名與 cents
+        note_name, octave, cents = self.frequency_to_note(freq, self._ref_a4)
+        is_in_tune = abs(cents) <= 5
+
+        if self._pitch_callback:
+            self._pitch_callback(note_name, octave, cents, freq, is_in_tune)
+
+    @classmethod
+    def detect_pitch(cls, signal: np.ndarray, sample_rate: int = 44100, thresh: float = 0.15) -> Optional[float]:
+        """使用業界標準 YIN 演算法精準計算樂器基頻 (Hz)"""
+        w_len = 2048
+        if len(signal) < w_len * 2:
+            return None
+
+        # 減去直流偏移
+        sig = signal[:w_len * 2] - np.mean(signal[:w_len * 2])
+        w = w_len
+        x = sig
+
+        # 1. 差分函數 (Difference function)
+        tau_max = w
+        d = np.zeros(tau_max, dtype=np.float32)
+        for tau in range(1, tau_max):
+            diff = x[:w] - x[tau:tau + w]
+            d[tau] = np.dot(diff, diff)
+
+        # 2. 累積均值歸一化差分 (CMNDF)
+        d_prime = np.zeros(tau_max, dtype=np.float32)
+        d_prime[0] = 1.0
+        cum_sum = 0.0
+        for tau in range(1, tau_max):
+            cum_sum += d[tau]
+            d_prime[tau] = d[tau] / (cum_sum / tau) if cum_sum > 0 else 1.0
+
+        # 3. 搜尋範圍限制在 30Hz ~ 2000Hz
+        min_tau = max(1, int(sample_rate / 2000.0))
+        max_tau = min(tau_max - 1, int(sample_rate / 30.0))
+
+        tau_chosen = None
+        for tau in range(min_tau, max_tau):
+            if d_prime[tau] < thresh:
+                # 尋找局部極小值
+                while tau + 1 < tau_max and d_prime[tau + 1] < d_prime[tau]:
+                    tau += 1
+                tau_chosen = tau
+                break
+
+        if tau_chosen is None:
+            # 若無低於門檻值者，取有效區間內的最小值
+            tau_chosen = min_tau + int(np.argmin(d_prime[min_tau:max_tau]))
+            if d_prime[tau_chosen] > 0.40:
+                # 非週期性噪音，過濾掉
+                return None
+
+        # 4. 拋物線插值求取亞取樣精準週期
+        p = tau_chosen
+        if 0 < p < tau_max - 1:
+            s0, s1, s2 = d_prime[p - 1], d_prime[p], d_prime[p + 1]
+            denom = 2 * (s0 - 2 * s1 + s2)
+            delta = (s0 - s2) / denom if abs(denom) > 1e-9 else 0.0
+            exact_tau = p + delta
+        else:
+            exact_tau = float(p)
+
+        if exact_tau <= 0:
+            return None
+
+        freq = float(sample_rate / exact_tau)
+        return freq
+
+
+    @classmethod
+    def frequency_to_note(cls, freq: float, ref_a4: float = 440.0) -> Tuple[str, int, float]:
+        """將頻率轉換為 (音名, 八度, cents偏差)"""
         if freq <= 0:
-            return "--", 0
+            return "--", 0, 0.0
 
         # 計算相對於 A4 的半音數
-        semitones = 12 * np.log2(freq / ref_a4)
-        nearest = round(semitones)
-        cents = round((semitones - nearest) * 100)
+        semitones = 12.0 * math.log2(freq / ref_a4)
+        midi_note = round(69 + semitones)
+        exact_semitones = semitones - (midi_note - 69)
+        cents = round(exact_semitones * 100.0, 1)
 
-        note_names = ["C", "C#", "D", "D#", "E", "F",
-                      "F#", "G", "G#", "A", "A#", "B"]
-        note_index = (nearest + 12 * 100) % 12
-        note_name = note_names[note_index]
+        note_idx = midi_note % 12
+        octave = (midi_note // 12) - 1
+        note_name = cls.NOTE_NAMES[note_idx]
 
-        return note_name, cents
+        return note_name, octave, cents
+
+    def get_closest_preset_target(self, current_freq: float) -> Tuple[str, float, float]:
+        """取得當前樂器預設中最接近的目標音
+        返回: (目標名稱, 目標頻率, 偏差Hz)
+        """
+        targets = self.INSTRUMENTS_PRESETS.get(self._current_instrument, [])
+        if not targets or targets[0][1] <= 0 or current_freq <= 0:
+            return "--", 0.0, 0.0
+
+        best_target = None
+        min_diff = float('inf')
+        for name, target_freq in targets:
+            diff = abs(current_freq - target_freq)
+            if diff < min_diff:
+                min_diff = diff
+                best_target = (name, target_freq, current_freq - target_freq)
+
+        return best_target
