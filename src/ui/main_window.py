@@ -74,7 +74,7 @@ class MainWindow(QMainWindow):
             self,
             "開啟樂譜",
             "",
-            "樂譜檔案 (*.pdf *.pdf);;圖片 (*.jpg *.png);;所有檔案 (*)"
+            "樂譜與圖片 (*.pdf *.jpg *.jpeg *.png *.webp *.bmp);;PDF 樂譜 (*.pdf);;圖片 (*.jpg *.jpeg *.png *.webp);;所有檔案 (*)"
         )
         if file_path:
             # 切換到自動翻譜頁並載入
