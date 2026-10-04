@@ -38,7 +38,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-glx libglib2.0-0 libasound2-dev portaudio19-dev
+          sudo apt-get install -y libgl1 libglx-mesa0 libglib2.0-0 libasound2-dev portaudio19-dev libegl1
+
 
       - name: Install Python dependencies
         run: |
