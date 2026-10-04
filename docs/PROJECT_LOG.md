@@ -160,12 +160,13 @@
 - 安裝依賴：`pip install -r requirements.txt`
 - **基本視窗成功顯示**，PyQt6 正常運作 ✅
 
-#### 跨平台開發原則（確立的共識）
-- Windows 和 Linux 共用同一個 repo、同一份 source code
-- 平台專屬程式碼寫在 `if sys.platform == "win32"` / `"linux"` 判斷裡
-- requirements.txt 可拆分成 `requirements-win.txt` / `requirements-linux.txt`
-- `.idea/` 設定檔存在各自本機，透過 `.gitignore` 排除
+#### 跨平台建置與自動化 Release 工作流確立
+- 建立 GitHub Actions 矩陣自動打包工作流（`.github/workflows/release.yml`）
+- 建立 PyInstaller 打包設定（`musicmate.spec`）與本機打包腳本（`scripts/build.py`）
+- 建立自動發布腳本（`scripts/release.py`），支援自動計算版號、提交並打 Tag 推送
+- **運作協議確立**：後續每次修改，AI 助理將自動執行完整的 Release 工作流，同步產出 Windows (.exe) 與 Ubuntu 執行檔供下載
 
 ---
 
 *本文件由夥計維護，记录所有專案相關討論。*
+
