@@ -166,7 +166,15 @@
 - 建立自動發布腳本（`scripts/release.py`），支援自動計算版號、提交並打 Tag 推送
 - **運作協議確立**：後續每次修改，AI 助理將自動執行完整的 Release 工作流，同步產出 Windows (.exe) 與 Ubuntu 執行檔供下載
 
+#### 節拍器跨平台音效引擎實作與發布
+- 解決 Linux (Ubuntu) 與 Windows 音訊相容性差異，放棄 Windows MIDI 獨佔依賴
+- 採用 NumPy 即時波形合成 6 種節拍音色（Click、木魚、Digital、小鼓、叮叮聲、狗吠）
+- 區分第一拍重音（高頻/大音量）與其他拍輕音
+- 支援音量調整（0~100%）與精確 time.perf_counter 無漂移計時迴圈
+- 完整連動 `MetronomePage` UI，使用 Qt pyqtSignal 驅動節拍指示燈動態跳動
+
 ---
 
 *本文件由夥計維護，记录所有專案相關討論。*
+
 

@@ -4,11 +4,16 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QButtonGroup
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal
+
+from src.core.metronome import Metronome
 
 
 class MetronomePage(QWidget):
     """節拍器頁面"""
+
+    # 定義跨執行緒安全的 Qt 信號：(beat_index, is_accent)
+    tick_signal = pyqtSignal(int, bool)
 
     def __init__(self):
         super().__init__()
@@ -16,6 +21,17 @@ class MetronomePage(QWidget):
         self._is_playing = False
         self._current_beat = 0
         self._beats_per_measure = 4
+
+        # 初始化後端節拍器引擎
+        self.metronome = Metronome()
+        self.metronome.bpm = self._bpm
+        self.metronome.beats_per_measure = self._beats_per_measure
+        self.metronome.volume = 0.7
+        self.metronome.set_tick_callback(self._on_metronome_tick)
+
+        # 連接每拍信號到 UI 更新槽函式
+        self.tick_signal.connect(self._handle_ui_tick)
+
         self._setup_ui()
 
     def _setup_ui(self):
@@ -23,7 +39,7 @@ class MetronomePage(QWidget):
         layout.setSpacing(20)
 
         # BPM 大字體顯示
-        self.bpm_label = QLabel("120")
+        self.bpm_label = QLabel(str(self._bpm))
         self.bpm_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bpm_label.setStyleSheet(
             "font-size: 96px; font-weight: bold; color: #0078D4;"
@@ -51,7 +67,7 @@ class MetronomePage(QWidget):
         # 拍號選擇
         ts_label = QLabel("拍號")
         ts_label.setStyleSheet("font-weight: bold;")
-        time_sig_group = QButtonGroup()
+        time_sig_group = QButtonGroup(self)
         time_sigs = [("2/4", 2), ("3/4", 3), ("4/4", 4),
                      ("5/4", 5), ("6/8", 6), ("7/8", 7), ("12/8", 12)]
         ts_layout = QHBoxLayout()
@@ -82,15 +98,15 @@ class MetronomePage(QWidget):
         sound_label = QLabel("音效")
         sound_label.setStyleSheet("font-weight: bold;")
         sound_layout = QHBoxLayout()
-        sounds = ["Click", "木魚", "Digital", "小鼓", "叮叮聲", "狗吠"]
+        self.sounds = ["Click", "木魚", "Digital", "小鼓", "叮叮聲", "狗吠"]
         self._sound_buttons = {}
-        sound_group = QButtonGroup()
-        for i, sound in enumerate(sounds):
+        sound_group = QButtonGroup(self)
+        for i, sound in enumerate(self.sounds):
             btn = QPushButton(sound)
             btn.setCheckable(True)
             if i == 0:
                 btn.setChecked(True)
-            btn.clicked.connect(lambda checked, s=sound: self._set_sound(s))
+            btn.clicked.connect(lambda checked, idx=i: self._set_sound(idx))
             sound_group.addButton(btn)
             sound_layout.addWidget(btn)
             self._sound_buttons[sound] = btn
@@ -103,6 +119,7 @@ class MetronomePage(QWidget):
         self.volume_slider.setMaximum(100)
         self.volume_slider.setValue(70)
         self.volume_slider.setMaximumWidth(200)
+        self.volume_slider.valueChanged.connect(self._on_volume_change)
         vol_layout.addWidget(self.volume_slider)
         vol_layout.addStretch()
 
@@ -146,32 +163,49 @@ class MetronomePage(QWidget):
     def _adjust_bpm(self, delta):
         self._bpm = max(40, min(240, self._bpm + delta))
         self.bpm_label.setText(str(self._bpm))
+        self.metronome.bpm = self._bpm
 
     def _set_bpm(self, bpm):
         self._bpm = bpm
         self.bpm_label.setText(str(self._bpm))
+        self.metronome.bpm = self._bpm
 
     def _set_time_sig(self, beats):
         self._beats_per_measure = beats
         self._current_beat = 0
+        self.metronome.beats_per_measure = beats
         self._update_indicator_state()
 
-    def _set_sound(self, sound):
-        # TODO: 實作音效切換
-        pass
+    def _set_sound(self, sound_index: int):
+        self.metronome.set_sound(sound_index)
+
+    def _on_volume_change(self, value: int):
+        self.metronome.volume = value / 100.0
+
+    def _on_metronome_tick(self, beat_index: int, is_accent: bool):
+        """核心執行緒每拍回調，透過 Qt 信號發送至主執行緒"""
+        self.tick_signal.emit(beat_index, is_accent)
+
+    def _handle_ui_tick(self, beat_index: int, is_accent: bool):
+        """在主執行緒中更新節拍指示燈動畫"""
+        self._current_beat = beat_index
+        self._update_indicator_state()
 
     def _update_indicator_state(self):
+        """刷新節拍指示燈顏色"""
         for i, light in enumerate(self._beat_lights):
             if i < self._beats_per_measure:
-                if i == self._current_beat:
-                    color = "#0078D4" if i == 0 else "#0099DD"
+                if self._is_playing and i == self._current_beat:
+                    # 當前拍高亮：第 1 拍重音為鮮紅/金橙，其他拍為 Fluent 深藍
+                    color = "#E81123" if i == 0 else "#0078D4"
                 else:
-                    color = "#ccc"
+                    color = "#d0d0d0"
                 light.setStyleSheet(f"font-size: 28px; color: {color};")
             else:
-                light.setStyleSheet("font-size: 28px; color: #eee;")
+                light.setStyleSheet("font-size: 28px; color: #f2f2f2;")
 
     def _on_toggle(self):
+        """切換啟動/停止"""
         self._is_playing = not self._is_playing
         if self._is_playing:
             self.start_btn.setText("⏹ STOP")
@@ -179,11 +213,20 @@ class MetronomePage(QWidget):
                 "QPushButton { background-color: #d32f2f; color: white; "
                 "font-size: 18px; border-radius: 8px; }"
             )
+            self._current_beat = 0
+            self.metronome.start()
         else:
             self.start_btn.setText("▶ START")
             self.start_btn.setStyleSheet(
                 "QPushButton { background-color: #0078D4; color: white; "
                 "font-size: 18px; border-radius: 8px; }"
             )
+            self.metronome.stop()
             self._current_beat = 0
             self._update_indicator_state()
+
+    def closeEvent(self, event):
+        """視窗關閉時確保背景執行緒停止"""
+        if self.metronome:
+            self.metronome.stop()
+        super().closeEvent(event)

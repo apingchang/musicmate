@@ -5,8 +5,12 @@
 """
 
 import numpy as np
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception:
+    sd = None
 from typing import Callable, Optional
+
 
 
 # TODO: 實作 FFT + 自相關音高偵測

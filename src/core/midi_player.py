@@ -6,8 +6,13 @@
 
 from typing import Callable, Optional
 
-import mido
-from mido import Message, MidiFile, MidiTrack
+try:
+    import mido
+    from mido import Message, MidiFile, MidiTrack
+except Exception:
+    mido = None
+    Message = MidiFile = MidiTrack = None
+
 
 
 # TODO: 實作 pygame simpleaudio MIDI 播放
