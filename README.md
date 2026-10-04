@@ -44,6 +44,27 @@ pytest
 pytest --lint
 ```
 
+## 打包與發布 (Packaging & Release)
+
+### 1. 本地打包 (Local Build)
+在本地環境（Windows 或 Ubuntu）一鍵打包為單一可執行檔：
+```bash
+python scripts/build.py
+```
+打包完成後可在 `dist/` 目錄找到執行檔：
+- Windows: `dist/MusicMate.exe`
+- Ubuntu: `dist/MusicMate`
+
+### 2. 自動發布 (CI/CD Release)
+專案配置了 GitHub Actions 跨平台矩陣打包工作流：
+- **發布新版本**：推送版本標籤即可自動於 GitHub Releases 產生 Windows `.exe` 與 Ubuntu 執行檔壓縮包：
+  ```bash
+  git tag v1.1.0
+  git push origin v1.1.0
+  ```
+- **手動觸發**：在 GitHub 頁面進入 **Actions** → 選擇 **Build and Release MusicMate** → 點擊 **Run workflow**。
+
+
 ## 授權
 
 MIT License © 2026 William Chang
