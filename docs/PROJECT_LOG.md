@@ -194,7 +194,10 @@
 - 快捷鍵完整支援：`Space` 播放/暫停、`PageUp` / `PageDown` / 方向鍵換頁、`Home` 回頂端、`F11` / `F` 全螢幕
 - 完成單元測試驗證，並更新本地 Linux 執行檔（`release/MusicMate`）
 
+#### 每次 Release 自動同步至 Windows PyCharm 目錄
+- 確立工作流程：平時僅在本地建置 Linux 執行檔，當使用者明確指示時才產出 Windows .exe
+- 於 `scripts/build.py` 與 `scripts/release.py` 自動加入同步機制，每次編譯或發布完成後，自動將專案資料夾全部目錄與檔案同步複製至 `/mnt/my_book/NTHU_GDrive/MyProjects/PycharmProjects/musicmate`，方便直接於 Windows PyCharm 開啟執行與測試
+
 ---
 
 *本文件由夥計維護，記錄所有專案相關討論。*
-
