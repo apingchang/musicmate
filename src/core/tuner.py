@@ -71,6 +71,7 @@ class Tuner:
         self._pitch_callback: Optional[Callable[[str, int, float, float, bool], None]] = None
         self._error_callback: Optional[Callable[[str], None]] = None
         self._current_instrument = "吉他"
+        self._pitch_history: list[float] = []  # 最近偵測頻率暫存，用於中值平滑防抖
 
     @property
     def ref_a4(self) -> float:
@@ -222,61 +223,77 @@ class Tuner:
         # 計算 RMS 音量
         rms = float(np.sqrt(np.mean(frame ** 2)))
         if rms < self._rms_threshold:
-            # 靜音狀態
+            # 靜音狀態，重置平滑隊列
+            self._pitch_history.clear()
             if self._pitch_callback:
                 self._pitch_callback("--", 0, 0.0, 0.0, False)
             return
 
         # 計算基頻
-        freq = self.detect_pitch(frame, self._sample_rate)
-        if freq is None or freq < 30.0 or freq > 2500.0:
-            if self._pitch_callback:
+        raw_freq = self.detect_pitch(frame, self._sample_rate)
+        if raw_freq is None or raw_freq < 30.0 or raw_freq > 4500.0:
+            if self._pitch_callback and len(self._pitch_history) == 0:
                 self._pitch_callback("--", 0, 0.0, 0.0, False)
             return
 
+        # 中值濾波防抖平滑（取最近 5 幀的中位數）
+        self._pitch_history.append(raw_freq)
+        if len(self._pitch_history) > 5:
+            self._pitch_history.pop(0)
+
+        # 排序取中位數，排除偶發諧波跳躍與噪聲尖峰
+        sorted_history = sorted(self._pitch_history)
+        stable_freq = sorted_history[len(sorted_history) // 2]
+
         # 轉換為音名與 cents
-        note_name, octave, cents = self.frequency_to_note(freq, self._ref_a4)
+        note_name, octave, cents = self.frequency_to_note(stable_freq, self._ref_a4)
         is_in_tune = abs(cents) <= 5
 
         if self._pitch_callback:
-            self._pitch_callback(note_name, octave, cents, freq, is_in_tune)
+            self._pitch_callback(note_name, octave, cents, stable_freq, is_in_tune)
 
     @classmethod
     def detect_pitch(cls, signal: np.ndarray, sample_rate: int = 44100, thresh: float = 0.15) -> Optional[float]:
-        """使用業界標準 YIN 演算法精準計算樂器基頻 (Hz)"""
+        """使用 FFT 加速且具備倍頻保護的 YIN 演算法計算樂器基頻 (Hz)
+        涵蓋鋼琴全音域：30 Hz (A0) ~ 4500 Hz (C8)
+        """
         w_len = 2048
         if len(signal) < w_len * 2:
             return None
 
         # 減去直流偏移
-        sig = signal[:w_len * 2] - np.mean(signal[:w_len * 2])
+        x = signal[:w_len * 2] - np.mean(signal[:w_len * 2])
         w = w_len
-        x = sig
 
-        # 1. 差分函數 (Difference function)
-        tau_max = w
-        d = np.zeros(tau_max, dtype=np.float32)
-        for tau in range(1, tau_max):
-            diff = x[:w] - x[tau:tau + w]
-            d[tau] = np.dot(diff, diff)
+        # 1. 使用 FFT 高效精確計算差分函數 d(tau)
+        # d(tau) = sum_{j=0}^{w-1} (x[j] - x[j+tau])^2
+        x_part = x[:w]
+        power = np.sum(x_part ** 2)
+        conv = np.fft.irfft(np.fft.rfft(x, n=w * 2) * np.conj(np.fft.rfft(x_part, n=w * 2)))
+        r = conv[:w]
+
+        cumsum = np.concatenate(([0], np.cumsum(x[:w * 2] ** 2)))
+        power_tau = cumsum[w: 2 * w] - cumsum[:w]
+        d = power + power_tau - 2 * r
+        d[0] = 0.0
 
         # 2. 累積均值歸一化差分 (CMNDF)
-        d_prime = np.zeros(tau_max, dtype=np.float32)
+        d_prime = np.zeros(w, dtype=np.float32)
         d_prime[0] = 1.0
-        cum_sum = 0.0
-        for tau in range(1, tau_max):
-            cum_sum += d[tau]
-            d_prime[tau] = d[tau] / (cum_sum / tau) if cum_sum > 0 else 1.0
+        cum_d = 0.0
+        for tau in range(1, w):
+            cum_d += d[tau]
+            d_prime[tau] = d[tau] / (cum_d / tau) if cum_d > 0 else 1.0
 
-        # 3. 搜尋範圍限制在 30Hz ~ 2000Hz
-        min_tau = max(1, int(sample_rate / 2000.0))
-        max_tau = min(tau_max - 1, int(sample_rate / 30.0))
+        # 3. 搜尋範圍限制在 30Hz ~ 4500Hz
+        min_tau = max(3, int(sample_rate / 4500.0))  # 4500Hz 對應約 9 samples
+        max_tau = min(w - 1, int(sample_rate / 30.0)) # 30Hz 對應約 1470 samples
 
+        # 尋找第一個低於 thresh 的局部極小值（週期最短、頻率最高之候選）
         tau_chosen = None
         for tau in range(min_tau, max_tau):
             if d_prime[tau] < thresh:
-                # 尋找局部極小值
-                while tau + 1 < tau_max and d_prime[tau + 1] < d_prime[tau]:
+                while tau + 1 < max_tau and d_prime[tau + 1] < d_prime[tau]:
                     tau += 1
                 tau_chosen = tau
                 break
@@ -284,13 +301,13 @@ class Tuner:
         if tau_chosen is None:
             # 若無低於門檻值者，取有效區間內的最小值
             tau_chosen = min_tau + int(np.argmin(d_prime[min_tau:max_tau]))
-            if d_prime[tau_chosen] > 0.40:
+            if d_prime[tau_chosen] > 0.35:
                 # 非週期性噪音，過濾掉
                 return None
 
         # 4. 拋物線插值求取亞取樣精準週期
         p = tau_chosen
-        if 0 < p < tau_max - 1:
+        if 0 < p < w - 1:
             s0, s1, s2 = d_prime[p - 1], d_prime[p], d_prime[p + 1]
             denom = 2 * (s0 - 2 * s1 + s2)
             delta = (s0 - s2) / denom if abs(denom) > 1e-9 else 0.0
