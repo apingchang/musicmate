@@ -132,20 +132,14 @@ def main():
         print(f"\n正在同步專案檔案至 Windows PyCharm 目錄：{sync_target} ...")
         rsync_cmd = [
             "rsync", "-rtv", "--modify-window=2",
-            "--exclude=.git",
             "--exclude=.venv",
             "--exclude=venv",
-            "--exclude=__pycache__",
-            "--exclude=*.pyc",
-            "--exclude=build",
-            "--exclude=dist",
-            "--exclude=release",
             f"{repo_root}/",
             f"{sync_target}/"
         ]
         sync_res = subprocess.run(rsync_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if sync_res.returncode == 0:
-            print("✓ 成功同步最新專案檔案至 Windows PyCharm 目錄！")
+            print("✓ 成功全量同步專案所有資料夾與檔案至 Windows PyCharm 目錄！")
         else:
             print(f"⚠️ 同步時發生警示：{sync_res.stderr.strip()}")
 
