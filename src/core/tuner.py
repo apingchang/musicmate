@@ -71,7 +71,6 @@ class Tuner:
         self._pitch_callback: Optional[Callable[[str, int, float, float, bool], None]] = None
         self._error_callback: Optional[Callable[[str], None]] = None
         self._current_instrument = "吉他"
-        self._pitch_history: list[float] = []  # 最近偵測頻率暫存，用於中值平滑防抖
 
     @property
     def ref_a4(self) -> float:
@@ -223,102 +222,75 @@ class Tuner:
         # 計算 RMS 音量
         rms = float(np.sqrt(np.mean(frame ** 2)))
         if rms < self._rms_threshold:
-            # 靜音狀態，重置平滑隊列
-            self._pitch_history.clear()
+            # 靜音狀態
             if self._pitch_callback:
                 self._pitch_callback("--", 0, 0.0, 0.0, False)
             return
 
         # 計算基頻
-        raw_freq = self.detect_pitch(frame, self._sample_rate)
-        if raw_freq is None or raw_freq < 30.0 or raw_freq > 4500.0:
-            if self._pitch_callback and len(self._pitch_history) == 0:
+        freq = self.detect_pitch(frame, self._sample_rate)
+        if freq is None or freq < 30.0 or freq > 5000.0:
+            if self._pitch_callback:
                 self._pitch_callback("--", 0, 0.0, 0.0, False)
             return
 
-        # 中值濾波防抖平滑（取最近 5 幀的中位數）
-        self._pitch_history.append(raw_freq)
-        if len(self._pitch_history) > 5:
-            self._pitch_history.pop(0)
-
-        # 排序取中位數，排除偶發諧波跳躍與噪聲尖峰
-        sorted_history = sorted(self._pitch_history)
-        stable_freq = sorted_history[len(sorted_history) // 2]
-
         # 轉換為音名與 cents
-        note_name, octave, cents = self.frequency_to_note(stable_freq, self._ref_a4)
+        note_name, octave, cents = self.frequency_to_note(freq, self._ref_a4)
         is_in_tune = abs(cents) <= 5
 
         if self._pitch_callback:
-            self._pitch_callback(note_name, octave, cents, stable_freq, is_in_tune)
+            self._pitch_callback(note_name, octave, cents, freq, is_in_tune)
 
     @classmethod
     def detect_pitch(cls, signal: np.ndarray, sample_rate: int = 44100, thresh: float = 0.15) -> Optional[float]:
-        """使用 FFT 加速且具備倍頻保護的 YIN 演算法計算樂器基頻 (Hz)
-        涵蓋鋼琴全音域：30 Hz (A0) ~ 4500 Hz (C8)
+        """使用高解析度 FFT 頻譜分析 + 漢寧窗 + 拋物線插值精確計算基頻 (Hz)
+        涵蓋樂器全音域：30 Hz (A0) ~ 5000 Hz，單音極度穩定、抗諧波跳躍
         """
-        w_len = 2048
-        if len(signal) < w_len * 2:
+        N = len(signal)
+        if N < 1024:
             return None
 
-        # 減去直流偏移
-        x = signal[:w_len * 2] - np.mean(signal[:w_len * 2])
-        w = w_len
+        # 1. 減去直流偏移
+        x = signal - np.mean(signal)
 
-        # 1. 使用 FFT 高效精確計算差分函數 d(tau)
-        # d(tau) = sum_{j=0}^{w-1} (x[j] - x[j+tau])^2
-        x_part = x[:w]
-        power = np.sum(x_part ** 2)
-        conv = np.fft.irfft(np.fft.rfft(x, n=w * 2) * np.conj(np.fft.rfft(x_part, n=w * 2)))
-        r = conv[:w]
+        # 2. 套用漢寧窗（Hanning Window）壓制頻譜旁瓣洩漏
+        window = np.hanning(N)
+        x_win = x * window
 
-        cumsum = np.concatenate(([0], np.cumsum(x[:w * 2] ** 2)))
-        power_tau = cumsum[w: 2 * w] - cumsum[:w]
-        d = power + power_tau - 2 * r
-        d[0] = 0.0
+        # 3. 補零提高頻譜內插解析度 (Zero-padding 到 16384 點)
+        N_fft = max(16384, N)
+        spectrum = np.abs(np.fft.rfft(x_win, n=N_fft))
+        freqs = np.fft.rfftfreq(N_fft, 1.0 / sample_rate)
 
-        # 2. 累積均值歸一化差分 (CMNDF)
-        d_prime = np.zeros(w, dtype=np.float32)
-        d_prime[0] = 1.0
-        cum_d = 0.0
-        for tau in range(1, w):
-            cum_d += d[tau]
-            d_prime[tau] = d[tau] / (cum_d / tau) if cum_d > 0 else 1.0
+        # 4. 音樂有效頻率遮罩：30 Hz ~ 5000 Hz
+        valid_mask = (freqs >= 30.0) & (freqs <= 5000.0)
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) == 0:
+            return None
 
-        # 3. 搜尋範圍限制在 30Hz ~ 4500Hz
-        min_tau = max(3, int(sample_rate / 4500.0))  # 4500Hz 對應約 9 samples
-        max_tau = min(w - 1, int(sample_rate / 30.0)) # 30Hz 對應約 1470 samples
+        sub_spec = spectrum[valid_indices]
+        max_sub_idx = int(np.argmax(sub_spec))
+        peak_idx = valid_indices[max_sub_idx]
 
-        # 尋找第一個低於 thresh 的局部極小值（週期最短、頻率最高之候選）
-        tau_chosen = None
-        for tau in range(min_tau, max_tau):
-            if d_prime[tau] < thresh:
-                while tau + 1 < max_tau and d_prime[tau + 1] < d_prime[tau]:
-                    tau += 1
-                tau_chosen = tau
-                break
+        # 5. 信噪比檢驗（顯著能量峰檢測）
+        peak_amp = spectrum[peak_idx]
+        mean_amp = float(np.mean(sub_spec))
+        if mean_amp <= 0 or (peak_amp / mean_amp) < 3.2:
+            # 能量不夠顯著，判定為環境底噪
+            return None
 
-        if tau_chosen is None:
-            # 若無低於門檻值者，取有效區間內的最小值
-            tau_chosen = min_tau + int(np.argmin(d_prime[min_tau:max_tau]))
-            if d_prime[tau_chosen] > 0.35:
-                # 非週期性噪音，過濾掉
-                return None
-
-        # 4. 拋物線插值求取亞取樣精準週期
-        p = tau_chosen
-        if 0 < p < w - 1:
-            s0, s1, s2 = d_prime[p - 1], d_prime[p], d_prime[p + 1]
-            denom = 2 * (s0 - 2 * s1 + s2)
-            delta = (s0 - s2) / denom if abs(denom) > 1e-9 else 0.0
-            exact_tau = p + delta
+        # 6. 拋物線插值求取亞取樣精確峰值頻率 (Parabolic Interpolation)
+        if 0 < peak_idx < len(spectrum) - 1:
+            y0 = float(spectrum[peak_idx - 1])
+            y1 = float(spectrum[peak_idx])
+            y2 = float(spectrum[peak_idx + 1])
+            denom = 2 * (y0 - 2 * y1 + y2)
+            delta = (y0 - y2) / denom if abs(denom) > 1e-9 else 0.0
+            exact_idx = peak_idx + delta
         else:
-            exact_tau = float(p)
+            exact_idx = float(peak_idx)
 
-        if exact_tau <= 0:
-            return None
-
-        freq = float(sample_rate / exact_tau)
+        freq = float(exact_idx * (sample_rate / N_fft))
         return freq
 
 
