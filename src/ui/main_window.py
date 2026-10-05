@@ -10,6 +10,7 @@ from src.ui.auto_scroll_page import AutoScrollPage
 from src.ui.metronome_page import MetronomePage
 from src.ui.tuner_page import TunerPage
 from src.ui.playback_page import PlaybackPage
+from src.version import get_window_title, VERSION, get_build_time_str
 
 
 class MainWindow(QMainWindow):
@@ -17,7 +18,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("練琴寶 MusicMate")
+        self.setWindowTitle(get_window_title())
         self.setMinimumSize(1200, 800)
 
         self._setup_ui()
@@ -88,7 +89,8 @@ class MainWindow(QMainWindow):
             self,
             "關於練琴寶",
             "<b>練琴寶 MusicMate</b><br>"
-            f"版本：1.1.0<br>"
+            f"版本：{VERSION}<br>"
+            f"修改/建置時間：{get_build_time_str()}<br>"
             "© 2026 William Chang<br><br>"
             "練琴時智能助手：自動翻譜 + 節拍器<br>"
             "+ 調音器 + 樂譜播放<br><br>"

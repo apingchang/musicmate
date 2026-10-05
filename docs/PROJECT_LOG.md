@@ -198,6 +198,12 @@
 - 確立工作流程：平時僅在本地建置 Linux 執行檔，當使用者明確指示時才產出 Windows .exe
 - 於 `scripts/build.py` 與 `scripts/release.py` 自動加入同步機制，每次編譯或發布完成後，自動將專案資料夾全部目錄與檔案同步複製至 `/mnt/my_book/NTHU_GDrive/MyProjects/PycharmProjects/musicmate`，方便直接於 Windows PyCharm 開啟執行與測試
 
+#### 視窗標題加入修改/建置時間
+- 建立 `src/version.py`，支援自動偵測原始碼最後修改時間或執行檔建置時間
+- 主視窗標題動態更新為：`練琴寶 MusicMate v{VERSION} (YYYY-MM-DD HH:MM)`
+- 「關於」對話框同步顯示修改/建置時間，便於直接於視圖上辨識當前版本
+
 ---
 
 *本文件由夥計維護，記錄所有專案相關討論。*
+
