@@ -229,7 +229,7 @@ class Tuner:
 
         # 計算基頻
         freq = self.detect_pitch(frame, self._sample_rate)
-        if freq is None or freq < 30.0 or freq > 5000.0:
+        if freq is None or freq < 20.0 or freq > 5000.0:
             if self._pitch_callback:
                 self._pitch_callback("--", 0, 0.0, 0.0, False)
             return
@@ -244,7 +244,7 @@ class Tuner:
     @classmethod
     def detect_pitch(cls, signal: np.ndarray, sample_rate: int = 44100, thresh: float = 0.15) -> Optional[float]:
         """使用高解析度 FFT 頻譜分析 + 漢寧窗 + 拋物線插值精確計算基頻 (Hz)
-        涵蓋樂器全音域：30 Hz (A0) ~ 5000 Hz，單音極度穩定、抗諧波跳躍
+        涵蓋樂器全音域：20 Hz (人耳聽覺極限/低音提琴/管風琴/鋼琴A0) ~ 5000 Hz (C8)
         """
         N = len(signal)
         if N < 1024:
@@ -257,13 +257,13 @@ class Tuner:
         window = np.hanning(N)
         x_win = x * window
 
-        # 3. 補零提高頻譜內插解析度 (Zero-padding 到 16384 點)
-        N_fft = max(16384, N)
+        # 3. 補零提高頻譜內插解析度 (Zero-padding 到 32768 點，頻率解析度達 1.34 Hz)
+        N_fft = max(32768, N)
         spectrum = np.abs(np.fft.rfft(x_win, n=N_fft))
         freqs = np.fft.rfftfreq(N_fft, 1.0 / sample_rate)
 
-        # 4. 音樂有效頻率遮罩：30 Hz ~ 5000 Hz
-        valid_mask = (freqs >= 30.0) & (freqs <= 5000.0)
+        # 4. 音樂有效頻率遮罩：20 Hz ~ 5000 Hz
+        valid_mask = (freqs >= 20.0) & (freqs <= 5000.0)
         valid_indices = np.where(valid_mask)[0]
         if len(valid_indices) == 0:
             return None
@@ -275,7 +275,7 @@ class Tuner:
         # 5. 信噪比檢驗（顯著能量峰檢測）
         peak_amp = spectrum[peak_idx]
         mean_amp = float(np.mean(sub_spec))
-        if mean_amp <= 0 or (peak_amp / mean_amp) < 3.2:
+        if mean_amp <= 0 or (peak_amp / mean_amp) < 3.0:
             # 能量不夠顯著，判定為環境底噪
             return None
 
