@@ -19,6 +19,7 @@ from PyQt6.QtGui import (
 )
 
 from src.core.score_analyzer import ScoreAnalyzer, ScoreAnalysis, StaffInfo, NoteEvent
+from src.core.note_synth import NoteSynthesizer
 
 
 class ScorePageWidget(QWidget):
@@ -223,10 +224,12 @@ class AutoScrollPage(QWidget):
         # 音符分析與演奏時間軸狀態
         self._analyzer = ScoreAnalyzer()
         self._analysis: Optional[ScoreAnalysis] = None
+        self._synth = NoteSynthesizer()
         self._track_mode = "note"  # "note" (方案A音符追蹤) | "scroll" (純垂直捲動)
         self._current_beat = 0.0
         self._last_tick_time = 0.0
         self._last_scrolled_staff: Tuple[int, int] = (-1, -1)
+        self._last_played_event_idx: int = -1
 
         # 滾動 / 游標定時器（約 30 FPS）
         self._scroll_timer = QTimer(self)
@@ -319,6 +322,26 @@ class AutoScrollPage(QWidget):
         row1.addWidget(self.speed_value_label)
 
         row1.addStretch()
+
+        # 聲音開關與音色選擇
+        self.sound_btn = QPushButton("🔊 聲音：開")
+        self.sound_btn.setCheckable(True)
+        self.sound_btn.setChecked(True)
+        self.sound_btn.setMinimumHeight(28)
+        self.sound_btn.setStyleSheet(
+            "QPushButton { padding: 2px 10px; border-radius: 4px; font-weight: bold; "
+            "background-color: #e6f4ea; color: #137333; border: 1px solid #a8dab5; }"
+            "QPushButton:!checked { background-color: #f1f3f4; color: #5f6368; border: 1px solid #dadce0; }"
+        )
+        self.sound_btn.toggled.connect(self._on_sound_toggle)
+        row1.addWidget(self.sound_btn)
+
+        self.timbre_combo = QComboBox()
+        self.timbre_combo.addItems(["鋼琴", "薩克斯風", "長笛"])
+        self.timbre_combo.setMinimumWidth(84)
+        self.timbre_combo.setMinimumHeight(28)
+        self.timbre_combo.currentTextChanged.connect(self._on_timbre_change)
+        row1.addWidget(self.timbre_combo)
 
         # 追蹤模式切換
         row1.addWidget(QLabel("模式："))
@@ -618,22 +641,34 @@ class AutoScrollPage(QWidget):
             "QPushButton:hover { background-color: #a82e00; }"
         )
         self._scroll_subpixel = 0.0
+        self._last_played_event_idx = -1
         self._last_tick_time = time.perf_counter()
         self._scroll_timer.start()
 
     def _stop_playing(self):
         self._is_playing = False
         self._scroll_timer.stop()
+        self._synth.stop_all()
+        self._last_played_event_idx = -1
         self.play_btn.setText("▶ 播放 (Space)")
         self.play_btn.setStyleSheet(
             "QPushButton { font-weight: bold; padding: 4px 14px; background-color: #107c41; color: white; border-radius: 4px; }"
             "QPushButton:hover { background-color: #0c5e31; }"
         )
 
+    def _on_sound_toggle(self, checked: bool):
+        self._synth.enabled = checked
+        self.sound_btn.setText("🔊 聲音：開" if checked else "🔇 聲音：關")
+
+    def _on_timbre_change(self, text: str):
+        self._synth.timbre = text
+
     def _on_restart(self):
         """回到第 1 小節並捲回頂端"""
         self._current_beat = 0.0
         self._last_scrolled_staff = (-1, -1)
+        self._last_played_event_idx = -1
+        self._synth.stop_all()
         self._scroll_to_top()
         if self._use_note_tracking():
             self._sync_playhead_visual(scroll_to_staff=True)
@@ -769,7 +804,18 @@ class AutoScrollPage(QWidget):
             note_y_norm=ev.y_norm,
             is_rest=ev.is_rest,
         )
-        self.measure_label.setText(f"小節：{ev.measure_number} / {self._analysis.total_measures}")
+        note_tag = f"  ♪ {ev.note_name}" if (not ev.is_rest and ev.note_name) else "  (休止)"
+        self.measure_label.setText(f"小節：{ev.measure_number} / {self._analysis.total_measures}{note_tag}")
+
+        # 播放中進入新音符時，即時合成並發聲
+        if self._is_playing and idx != self._last_played_event_idx:
+            self._last_played_event_idx = idx
+            if not ev.is_rest and ev.midi_note > 0:
+                beats_per_sec = max(0.2, (self._bpm / 60.0) * self._scroll_speed)
+                dur_sec = max(0.10, (ev.duration_beats / beats_per_sec) * 0.95)
+                self._synth.play_note(ev.midi_note, duration_sec=dur_sec)
+            else:
+                self._synth.stop_all()
 
         # 換行時自動將作用中的五線譜捲動到視窗舒適閱讀位置（上方 35% 處）
         staff_key = (ev.page_index, ev.staff_index)
@@ -814,7 +860,10 @@ class AutoScrollPage(QWidget):
         nearest_ev = min(staff_events, key=lambda ev: abs(ev.x_norm - x_norm))
         self._current_beat = nearest_ev.beat_offset
         self._last_scrolled_staff = (page_index, best_staff.staff_index)
+        self._last_played_event_idx = -1
         self._sync_playhead_visual(scroll_to_staff=False)
+        if not self._is_playing and not nearest_ev.is_rest and nearest_ev.midi_note > 0:
+            self._synth.play_note(nearest_ev.midi_note, duration_sec=0.25)
         self.status_text.setText(f"已跳轉至第 {nearest_ev.measure_number} 小節。")
 
     def _on_scroll_changed(self, value):

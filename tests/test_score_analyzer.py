@@ -14,6 +14,7 @@ if not _app:
     _app = QApplication([])
 
 from src.core.score_analyzer import ScoreAnalyzer
+from src.core.note_synth import NoteSynthesizer
 from src.ui.auto_scroll_page import AutoScrollPage
 
 
@@ -63,9 +64,25 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertAlmostEqual(res.total_beats, 24.0, places=2)
         self.assertGreaterEqual(len(res.events), 14)
 
-        # 驗證時間軸單調遞增
+        # 驗證時間軸單調遞增且每個非休止事件都有有效 MIDI 音高
         for i in range(1, len(res.events)):
             self.assertGreaterEqual(res.events[i].beat_offset, res.events[i - 1].beat_offset)
+        pitched = [ev for ev in res.events if not ev.is_rest]
+        self.assertGreater(len(pitched), 0)
+        for ev in pitched:
+            self.assertGreaterEqual(ev.midi_note, 36)
+            self.assertLessEqual(ev.midi_note, 96)
+            self.assertTrue(len(ev.note_name) >= 2)
+
+    def test_note_synthesizer_wave_generation(self):
+        synth = NoteSynthesizer()
+        self.assertAlmostEqual(synth.midi_to_freq(69), 440.0, places=2)
+        for timbre in ("鋼琴", "薩克斯風", "長笛"):
+            synth.timbre = timbre
+            pcm = synth.synthesize_wave(60, 0.25)
+            self.assertEqual(pcm.dtype, np.int16)
+            self.assertGreater(len(pcm), 4000)
+            self.assertGreater(int(np.max(np.abs(pcm))), 1000)
 
     def test_auto_scroll_page_note_tracking_and_click_seek(self):
         rgb = _create_synthetic_score_rgb()

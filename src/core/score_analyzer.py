@@ -25,6 +25,8 @@ class NoteEvent:
     beat_offset: float
     duration_beats: float
     is_rest: bool = False
+    midi_note: int = 0
+    note_name: str = ""
 
 
 @dataclass
@@ -265,6 +267,7 @@ class ScoreAnalyzer:
                     for k, (nx, ny) in enumerate(m_notes):
                         dur = beats_per_measure * (spans[k] / total_span) if total_span > 0 else (beats_per_measure / len(m_notes))
                         nx_n, ny_n = self._map_back(nx, ny, M_inv, w, h)
+                        midi_val, n_name = self._y_to_treble_pitch(ny, y_bot, sp)
                         ev = NoteEvent(
                             page_index=page_index,
                             staff_index=s_idx,
@@ -274,6 +277,8 @@ class ScoreAnalyzer:
                             beat_offset=local_beat,
                             duration_beats=dur,
                             is_rest=False,
+                            midi_note=midi_val,
+                            note_name=n_name,
                         )
                         measure_info.notes.append(ev)
                         page_res.events.append(ev)
@@ -460,6 +465,23 @@ class ScoreAnalyzer:
         if all(abs(cand_x - nx) > sp * 0.95 for nx, _ in note_pts):
             barlines.append(cand_x)
         return barlines
+
+    @staticmethod
+    def _y_to_treble_pitch(ny: float, y_bot: float, sp: float) -> Tuple[int, str]:
+        """依據高音譜號五線譜垂直位置推算 MIDI 音高與音名（線距 sp = 2 個自然音階步）"""
+        if sp <= 0:
+            return 60, "C4"
+        # 底線 y_bot = E4（step = 0），每往上 0.5 * sp 為 1 個自然音階步
+        step = int(round((y_bot - ny) / (sp / 2.0)))
+        step = max(-14, min(20, step))
+        diatonic_idx = 2 + step  # C=0, D=1, E=2, F=3, G=4, A=5, B=6
+        octave = 4 + (diatonic_idx // 7)
+        deg = diatonic_idx % 7
+        semitones = (0, 2, 4, 5, 7, 9, 11)
+        names = ("C", "D", "E", "F", "G", "A", "B")
+        midi = (octave + 1) * 12 + semitones[deg]
+        midi = max(36, min(96, midi))
+        return midi, f"{names[deg]}{octave}"
 
     @staticmethod
     def _map_back(
