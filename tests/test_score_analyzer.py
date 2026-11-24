@@ -109,6 +109,55 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertEqual(first_ev.rest_measures, 2)
         self.assertAlmostEqual(first_ev.duration_beats, 4.0, places=2)
 
+        # 驗證放大到 2400px 高解析度時，粗體數字 "2" 跨在第一線上仍能精準辨識為休止 2 小節
+        hires = cv2.resize(img, (2400, 850), interpolation=cv2.INTER_CUBIC)
+        res_hi = self.analyzer.analyze_pages([hires], beats_per_measure=2.0)
+        self.assertTrue(res_hi.has_staves)
+        self.assertTrue(res_hi.events[0].is_rest)
+        self.assertEqual(res_hi.events[0].rest_measures, 2)
+        self.assertEqual(res_hi.events[0].note_type, "休止 2 小節")
+
+    def test_measure_step_and_note_step_calibration_ui(self):
+        """驗證逐小節播放、逐音符步進與詳細音符資訊列及偵測標記疊層"""
+        rgb = _create_synthetic_score_rgb()
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        cv2.imwrite(path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        self.temp_files.append(path)
+
+        page = AutoScrollPage()
+        page.sound_btn.setChecked(False)  # 測試環境靜音
+        self.assertTrue(page.load_file(path))
+
+        # 1. 測試逐音符步進：下一音 / 上一音
+        page._on_next_note()
+        idx1, ev1 = page._find_event_at_beat(page._current_beat)
+        self.assertEqual(idx1, 1)
+        self.assertEqual(ev1.event_index, 2)
+        detail_txt = page.note_detail_label.text()
+        self.assertIn("事件 #2", detail_txt)
+        self.assertIn("音符", detail_txt)
+        self.assertIn("Hz", detail_txt)
+
+        page._on_prev_note()
+        idx0, _ = page._find_event_at_beat(page._current_beat)
+        self.assertEqual(idx0, 0)
+
+        # 2. 測試逐小節跳轉與「播本小節」自動設定停止拍點
+        page._on_next_measure()
+        _, ev_m2 = page._find_event_at_beat(page._current_beat)
+        self.assertEqual(ev_m2.measure_number, 2)
+
+        page._on_play_current_measure()
+        self.assertTrue(page._is_playing)
+        self.assertIsNotNone(page._stop_at_beat)
+        page._stop_playing()
+
+        # 3. 測試開啟「顯示偵測標記」渲染無誤
+        page.debug_overlay_chk.setChecked(True)
+        pm_grab = page.score_view.page_labels[0].grab()
+        self.assertFalse(pm_grab.isNull())
+
     def test_auto_scroll_page_note_tracking_and_click_seek(self):
         rgb = _create_synthetic_score_rgb()
         fd, path = tempfile.mkstemp(suffix=".png")
