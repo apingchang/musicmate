@@ -1,14 +1,16 @@
-"""樂譜影像結構分析引擎 (OpenCV OMR Lite v4 - 去底色強化與精準符頭切分版)
+"""樂譜影像結構分析引擎 (OpenCV OMR Lite v5 - 分段追蹤逐行拉直與去底色精準切分版)
 
 核心處理流程：
 1. 去底色與對比強化 (Division Illumination Normalization)：消除泛黃紙色、手機拍照陰影與背面透字
-2. 尺度標準化 (寬度統一至 1200 px) 與水平投影梯度最大化傾斜校正 (Deskew)
-3. 五線譜偵測與譜頭自動跳過 (自動辨識並略過譜號 Clef 與拍號如 2/4，絕不誤判為音符)
-4. 全域細橫線抹除 (移除五線譜線與上/下加線翅膀，同時 100% 保留加線上的高音符頭如 A5/B5/C6)
-5. 細直符幹剝離 (Stem Removal) + 跨雙幹短橫槓過濾 (Stem-Bridging Filter)：切出每顆獨立音符與雙裝飾音
-6. 反覆記號雙點 (|: / :|) 與多小節休止符 (H-bar + 數字 2..8) 精準辨識
+2. 自適應高解析度縮放 (確保單行與整頁 A4 多行樂譜皆具備清晰五線譜間距 sp ≈ 12~16 px)
+3. 垂直分片五線譜追蹤 (Multi-Slice Comb Tracking) + 逐行曲面/傾斜拉直 (Per-Staff Remap Flattening)：
+   徹底解決手機翻拍書頁時「上行斜、下行平」的透視變形與書脊彎曲，杜絕斜線投影壓扁成假窄譜與假小節線
+4. 譜頭自動跳過 (自動辨識並略過譜號 Clef 與拍號如 2/4，絕不誤判為音符)
+5. 全域細橫線抹除 + 細直符幹剝離 + 跨雙幹短橫槓過濾：切出每顆獨立音符、十六分音符、裝飾音與高音加線音符
+6. 反覆記號雙點 (|: / :|) 過濾與多小節休止符 (H-bar + 數字 2..8) 精準辨識
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 import cv2
@@ -63,7 +65,7 @@ class MeasureInfo:
 
 @dataclass
 class StaffInfo:
-    """單一行五線譜資訊"""
+    """單一行五線譜資訊（含隨 x 變化的傾斜/彎曲上下界軌跡）"""
     page_index: int
     staff_index: int
     y_top_norm: float
@@ -73,6 +75,16 @@ class StaffInfo:
     spacing_norm: float
     barlines_norm: List[float] = field(default_factory=list)
     measures: List[MeasureInfo] = field(default_factory=list)
+    curve_xs_norm: List[float] = field(default_factory=list)
+    curve_y_tops_norm: List[float] = field(default_factory=list)
+    staff_height_norm: float = 0.0
+
+    def y_range_at(self, x_norm: float) -> Tuple[float, float]:
+        """取得此行五線譜在指定水平位置 x_norm 的精確 (y_top_norm, y_bot_norm)"""
+        if self.curve_xs_norm and self.curve_y_tops_norm and self.staff_height_norm > 0:
+            yt = float(np.interp(x_norm, self.curve_xs_norm, self.curve_y_tops_norm))
+            return yt, yt + self.staff_height_norm
+        return self.y_top_norm, self.y_bot_norm
 
 
 @dataclass
@@ -131,17 +143,17 @@ class _HorizBar:
 
 
 class ScoreAnalyzer:
-    """純 OpenCV 去底色強化與精準音符切分引擎"""
+    """純 OpenCV 去底色強化、逐行曲面拉直與精準音符切分引擎"""
 
-    TARGET_WIDTH = 1200
+    BASE_WIDTH = 1300
 
     @staticmethod
     def enhance_score_gray(gray: np.ndarray) -> np.ndarray:
         """去底色與對比強化：消除泛黃紙張、拍照陰影漸層與背面透字，輸出純白底深黑墨跡灰階圖"""
         h, w = gray.shape[:2]
         ref_dim = max(w, h)
-        # 膨脹核大於實心符頭與多小節休止橫條厚度（1200px 時約 15px），避免黑塊被當背景掏空
-        k_dil = max(15, int(round(ref_dim / 80)) | 1)
+        # 膨脹核大於實心符頭與多小節休止橫條厚度，避免實心黑塊被當成背景掏空
+        k_dil = max(15, int(round(ref_dim / 75)) | 1)
         k_blur = max(51, int(round(ref_dim / 22)) | 1)
         bg = cv2.dilate(gray, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil)))
         bg = cv2.GaussianBlur(bg, (k_blur, k_blur), 0)
@@ -202,15 +214,17 @@ class ScoreAnalyzer:
             orig_gray = rgb.copy()
 
         orig_h, orig_w = orig_gray.shape[:2]
-        if orig_h < 100 or orig_w < 100:
+        if orig_h < 80 or orig_w < 100:
             return PageAnalysis(page_index, orig_w, orig_h, 0.0), start_beat, start_measure_num, start_event_idx
 
-        # 1. 標準化分析寬度至 1200 px，確保所有形態學核心尺度一致
-        if abs(orig_w - self.TARGET_WIDTH) > 80:
-            scale = self.TARGET_WIDTH / float(orig_w)
-            w = self.TARGET_WIDTH
-            h = max(100, int(round(orig_h * scale)))
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        # 1. 自適應標準化分析寬度（橫向截圖約 1300px，直向整頁 A4 自動放大至最高 1750px 確保譜線間距充足）
+        aspect_hw = orig_h / max(1.0, float(orig_w))
+        target_w = int(np.clip(self.BASE_WIDTH * max(1.0, aspect_hw * 0.92), 1300, 1750))
+        if abs(orig_w - target_w) > 60:
+            scale = target_w / float(orig_w)
+            w = target_w
+            h = max(80, int(round(orig_h * scale)))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
             gray = cv2.resize(orig_gray, (w, h), interpolation=interp)
         else:
             gray = orig_gray
@@ -219,44 +233,49 @@ class ScoreAnalyzer:
         # 2. 先執行去底色與對比強化！消除紙色、陰影與透字
         clean_gray = self.enhance_score_gray(gray)
 
-        # 3. 偵測傾斜角度並校正
-        skew = self._estimate_skew(clean_gray)
-        if abs(skew) > 0.05:
-            M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), skew, 1.0)
-            M_inv = cv2.invertAffineTransform(M)
-            clean_d = cv2.warpAffine(
-                clean_gray, M, (w, h),
-                flags=cv2.INTER_LINEAR,
-                borderValue=255,
-            )
-        else:
-            M_inv = None
-            clean_d = clean_gray
+        # 3. 垂直分片追蹤每行五線譜（支援不同行各自傾斜、透視變形與書頁彎曲）
+        staff_tracks = self._detect_curved_staves(clean_gray)
 
-        # 去底色後 >220 之紙張底色與淡透印皆為純白 255；門檻 210 完整保留細五線譜線、十六分音符與裝飾音符頭
-        binary = ((clean_d < 210).astype(np.uint8)) * 255
-
-        # 4. 偵測五線譜行
-        raw_staves = self._detect_staves(binary, w, h)
+        slopes_deg = []
+        for trk in staff_tracks:
+            if len(trk) >= 2 and (trk[-1][0] - trk[0][0]) > 20:
+                slopes_deg.append(math.degrees(math.atan2(trk[-1][1] - trk[0][1], trk[-1][0] - trk[0][0])))
+        avg_skew = float(np.median(slopes_deg)) if slopes_deg else 0.0
 
         page_res = PageAnalysis(
             page_index=page_index,
             width=orig_w,
             height=orig_h,
-            skew_angle=skew,
+            skew_angle=avg_skew,
         )
 
         cur_beat = start_beat
         cur_measure = start_measure_num
         cur_ev_idx = start_event_idx
 
-        for s_idx, (y_top, y_bot, sp, xl, xr, line_ys) in enumerate(raw_staves):
-            # 5. 自動偵測譜頭區（譜號 + 調號 + 拍號如 2/4）結束位置，並切分所有獨立音符與橫槓
+        for s_idx, track in enumerate(staff_tracks):
+            # 4. 將此行五線譜獨立沿正交曲線拉直為水平帶狀影像 strip_bin（橫線歸 0°、直立小節線與符幹同步歸 90°！）
+            strip_bin, y_shift, slope_arr, center_dy, sy1, sy2, sp, xl, xr = self._straighten_staff_strip(clean_gray, track)
+            if xr - xl < sp * 6.0:
+                continue
+
+            def to_page_norm(px: float, py_in_strip: float) -> Tuple[float, float]:
+                ix = int(np.clip(round(px), 0, w - 1))
+                ox = float(px) - float(slope_arr[ix]) * (float(py_in_strip) - center_dy)
+                oy = float(y_shift[ix]) + float(py_in_strip)
+                return (
+                    float(np.clip(ox / max(1.0, float(w)), 0.0, 1.0)),
+                    float(np.clip(oy / max(1.0, float(h)), 0.0, 1.0)),
+                )
+
+            # 5. 在 100% 拉直的五線譜帶上偵測譜頭結束位置、獨立音符、橫槓與小節線
             raw_notes, horiz_bars, header_end_x = self._detect_notes_and_bars(
-                binary, y_top, y_bot, sp, xl, xr
+                strip_bin, sy1, sy2, sp, xl, xr
             )
             main_note_pts = [(n.x, n.y) for n in raw_notes if not n.is_grace]
-            barlines = self._detect_barlines(binary, y_top, y_bot, sp, xl, xr, main_note_pts)
+            barlines = self._detect_barlines(
+                strip_bin, sy1, sy2, sp, xl, xr, main_note_pts, horiz_bars
+            )
 
             # 6. 過濾緊鄰小節線的反覆記號雙點 (|: / :|，寬度 < 0.85*sp 且距小節線 < 1.45*sp)
             if barlines:
@@ -275,51 +294,72 @@ class ScoreAnalyzer:
 
             clean_edges = [seg_edges[0]]
             for ex in seg_edges[1:]:
-                if ex - clean_edges[-1] >= sp * 2.2:
+                if ex - clean_edges[-1] >= sp * 2.4:
                     clean_edges.append(ex)
             if len(clean_edges) < 2:
                 clean_edges = [header_end_x, float(xr)]
 
-            tl_x, tl_y = self._map_back(xl, y_top, M_inv, w, h)
-            br_x, br_y = self._map_back(xr, y_bot, M_inv, w, h)
-            barlines_norm = [self._map_back(bx, (y_top + y_bot) / 2.0, M_inv, w, h)[0] for bx in valid_bars]
+            # 建立此行五線譜隨 x 變化的精確上下軌跡（供 UI 繪製貼合傾斜/彎曲譜面的高亮帶與游標）
+            sample_xs = np.linspace(float(xl), float(xr), 17)
+            curve_xs_norm = [float(x / w) for x in sample_xs]
+            curve_y_tops_norm = [to_page_norm(float(x), sy1)[1] for x in sample_xs]
+            staff_h_norm = float((sy2 - sy1) / max(1.0, float(h)))
+            mean_yt_norm = float(np.mean(curve_y_tops_norm))
 
             staff_info = StaffInfo(
                 page_index=page_index,
-                staff_index=s_idx,
-                y_top_norm=tl_y,
-                y_bot_norm=br_y,
-                x_left_norm=tl_x,
-                x_right_norm=br_x,
+                staff_index=len(page_res.staves),
+                y_top_norm=mean_yt_norm,
+                y_bot_norm=min(1.0, mean_yt_norm + staff_h_norm),
+                x_left_norm=float(xl) / float(w),
+                x_right_norm=float(xr) / float(w),
                 spacing_norm=sp / float(h),
-                barlines_norm=barlines_norm,
+                barlines_norm=[float(bx) / float(w) for bx in valid_bars],
+                curve_xs_norm=curve_xs_norm,
+                curve_y_tops_norm=curve_y_tops_norm,
+                staff_height_norm=staff_h_norm,
             )
+            real_s_idx = staff_info.staff_index
 
             # 7. 建立每個小節與節拍時間軸
             for m_i in range(len(clean_edges) - 1):
                 mx1 = clean_edges[m_i]
                 mx2 = clean_edges[m_i + 1]
-
-                # 尋找此小節內的五線譜中央粗橫條（H-bar 多小節休止符：須位於小節內部且非整條譜線）
                 m_width = max(1.0, mx2 - mx1)
+
+                # 尋找此小節內的五線譜中央粗橫條（H-bar 多小節休止符：位於小節內部且非整條譜線）
                 mid_rest_bars = [
                     b for b in horiz_bars
                     if b.in_staff_mid
-                    and sp * 2.2 <= b.width <= min(sp * 9.5, m_width * 0.80)
-                    and b.x1 >= mx1 + sp * 0.5
-                    and b.x2 <= mx2 - sp * 0.5
+                    and sp * 2.2 <= b.width <= min(sp * 9.5, m_width * 0.82)
+                    and b.x1 >= mx1 + sp * 0.45
+                    and b.x2 <= mx2 - sp * 0.45
                 ]
 
                 m_notes_all = [n for n in raw_notes if mx1 <= n.x <= mx2]
 
-                # 若存在中央休止粗橫條，僅排除橫條正上方且無符幹的休止數字（如跨在第一線間的 "2"），絕不刪除有符幹的真實音符！
+                # 若存在中央休止粗橫條，排除橫條正上方的休止數字（如跨在第一線上的粗體 "2"，其與中央橫條間有明顯空白斷開，並非連槓音符！）
                 if mid_rest_bars:
                     rest_bar = max(mid_rest_bars, key=lambda b: b.width)
+                    # 檢查中央橫條上方是否有真正連通到橫條的長符幹（區分 M7 高音連槓音符 vs M1 懸空數字 "2"）
+                    bx0 = max(0, int(round(rest_bar.x1)))
+                    bx1 = min(strip_bin.shape[1], int(round(rest_bar.x2)))
+                    gap_y1 = max(0, int(round(sy1 + sp * 0.55)))
+                    gap_y2 = max(gap_y1 + 2, int(round(rest_bar.y_center - sp * 0.35)))
+                    gap_patch = strip_bin[gap_y1:gap_y2, bx0:bx1]
+                    # 真實下垂符幹會在 gap_patch 形成貫穿上下的細直柱；而懸空數字 "2" 下方與橫條之間是空白的！
+                    has_connecting_stem = (
+                        gap_patch.size > 0
+                        and int(np.max(np.sum(gap_patch > 0, axis=0))) >= max(3, int((gap_y2 - gap_y1) * 0.85))
+                    )
                     real_notes_in_m = [
                         n for n in m_notes_all
-                        if n.has_stem
-                        or n.y >= rest_bar.y_center
-                        or not (rest_bar.x1 - sp * 0.6 <= n.x <= rest_bar.x2 + sp * 0.6)
+                        if not (
+                            (rest_bar.x1 - sp * 0.65 <= n.x <= rest_bar.x2 + sp * 0.65)
+                            and (n.y < rest_bar.y_center)
+                            and (not has_connecting_stem or n.is_grace)
+                        )
+                        and not n.is_grace
                     ]
                     if len(real_notes_in_m) == 0:
                         m_notes_all = []
@@ -329,15 +369,18 @@ class ScoreAnalyzer:
                     rest_bar = None
 
                 if rest_bar is not None and len(m_notes_all) == 0:
-                    rest_count = self._estimate_rest_bar_count(binary, rest_bar, y_top, sp)
+                    rest_count = self._estimate_rest_bar_count(strip_bin, rest_bar, sy1, sp)
                 elif len(m_notes_all) == 0:
                     rest_count = 1
                 else:
                     rest_count = 0
 
                 cur_measure += 1
-                m_x1_n, m_yt_n = self._map_back(mx1, y_top, M_inv, w, h)
-                m_x2_n, m_yb_n = self._map_back(mx2, y_bot, M_inv, w, h)
+                mcx = 0.5 * (mx1 + mx2)
+                _, m_yt_n = to_page_norm(mcx, sy1)
+                _, m_yb_n = to_page_norm(mcx, sy2)
+                m_x1_n = float(np.clip(mx1 / float(w), 0.0, 1.0))
+                m_x2_n = float(np.clip(mx2 / float(w), 0.0, 1.0))
 
                 if rest_count > 0:
                     total_rest_beats = beats_per_measure * rest_count
@@ -345,7 +388,7 @@ class ScoreAnalyzer:
                     m_beat_end = cur_beat + total_rest_beats
                     measure_info = MeasureInfo(
                         page_index=page_index,
-                        staff_index=s_idx,
+                        staff_index=real_s_idx,
                         measure_number=cur_measure,
                         x_start_norm=m_x1_n,
                         x_end_norm=m_x2_n,
@@ -355,13 +398,13 @@ class ScoreAnalyzer:
                         beat_end=m_beat_end,
                         rest_measures=rest_count,
                     )
-                    cx_n, cy_n = self._map_back((mx1 + mx2) / 2.0, (y_top + y_bot) / 2.0, M_inv, w, h)
+                    cx_n, cy_n = to_page_norm(mcx, 0.5 * (sy1 + sy2))
                     cur_ev_idx += 1
                     r_label = f"休止 {rest_count} 小節" if rest_count > 1 else "整小節休止"
                     ev = NoteEvent(
                         event_index=cur_ev_idx,
                         page_index=page_index,
-                        staff_index=s_idx,
+                        staff_index=real_s_idx,
                         measure_number=cur_measure,
                         note_index_in_measure=1,
                         notes_in_measure=1,
@@ -387,7 +430,7 @@ class ScoreAnalyzer:
                 m_beat_end = cur_beat + beats_per_measure
                 measure_info = MeasureInfo(
                     page_index=page_index,
-                    staff_index=s_idx,
+                    staff_index=real_s_idx,
                     measure_number=cur_measure,
                     x_start_norm=m_x1_n,
                     x_end_norm=m_x2_n,
@@ -403,13 +446,13 @@ class ScoreAnalyzer:
                 local_beat = m_beat_start
                 total_in_m = len(m_notes_all)
                 for k_idx, (note_obj, dur, n_type) in enumerate(zip(m_notes_all, durations, note_types), start=1):
-                    nx_n, ny_n = self._map_back(note_obj.x, note_obj.y, M_inv, w, h)
-                    midi_val, n_name = self._y_to_treble_pitch(note_obj.y, y_bot, sp)
+                    nx_n, ny_n = to_page_norm(note_obj.x, note_obj.y)
+                    midi_val, n_name = self._y_to_treble_pitch(note_obj.y, sy2, sp)
                     cur_ev_idx += 1
                     ev = NoteEvent(
                         event_index=cur_ev_idx,
                         page_index=page_index,
-                        staff_index=s_idx,
+                        staff_index=real_s_idx,
                         measure_number=cur_measure,
                         note_index_in_measure=k_idx,
                         notes_in_measure=total_in_m,
@@ -436,6 +479,267 @@ class ScoreAnalyzer:
             page_res.staves.append(staff_info)
 
         return page_res, cur_beat, cur_measure, cur_ev_idx
+
+    @staticmethod
+    def _detect_curved_staves(clean_gray: np.ndarray) -> List[List[Tuple[float, float, float, float]]]:
+        """垂直分片五線譜偵測：即使同一頁不同行傾斜角不同或書脊彎曲，仍能精準追蹤每一行 5 條線"""
+        h, w = clean_gray.shape[:2]
+        b = ((clean_gray < 212).astype(np.uint8)) * 255
+        # 短水平結構核可容忍高達 ±6° 斜率而不斷裂
+        hlen = max(10, w // 95)
+        horiz = cv2.morphologyEx(b, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (hlen, 1)))
+
+        n_slices = 16
+        slice_w = max(40, w // 10)
+        xs_centers = np.linspace(slice_w // 2, w - slice_w // 2, n_slices)
+        min_sp = max(5.5, w / 225.0)
+        max_sp = max(20.0, w / 26.0)
+        kernel_1d = np.array([0.2, 0.6, 1.0, 0.6, 0.2], dtype=np.float32)
+
+        slice_combs: List[List[Tuple[float, float, float, float]]] = []
+        for xc in xs_centers:
+            x0 = max(0, int(xc - slice_w // 2))
+            x1 = min(w, int(xc + slice_w // 2))
+            sw = max(1, x1 - x0)
+            proj = np.sum(horiz[:, x0:x1] > 0, axis=1).astype(np.float32)
+            ps = np.convolve(proj, kernel_1d, mode="same")
+
+            peaks: List[Tuple[float, float]] = []
+            min_peak_dist = max(4, int(min_sp * 0.62))
+            for r in range(3, h - 3):
+                if (
+                    ps[r] >= sw * 0.28
+                    and ps[r] >= ps[r - 1]
+                    and ps[r] >= ps[r + 1]
+                    and ps[r] >= ps[r - 2]
+                    and ps[r] >= ps[r + 2]
+                ):
+                    if not peaks or (r - peaks[-1][0]) >= min_peak_dist:
+                        peaks.append((float(r), float(ps[r])))
+                    elif ps[r] > peaks[-1][1]:
+                        peaks[-1] = (float(r), float(ps[r]))
+
+            p_ys = [p[0] for p in peaks]
+            combs: List[Tuple[float, float, float, float]] = []
+            idx = 0
+            while idx + 4 < len(p_ys):
+                grp = p_ys[idx:idx + 5]
+                diffs = np.diff(grp)
+                med = float(np.median(diffs))
+                if min_sp <= med <= max_sp and np.all(np.abs(diffs - med) <= max(2.2, med * 0.22)):
+                    combs.append((float(xc), grp[0], grp[4], med))
+                    idx += 5
+                else:
+                    idx += 1
+            slice_combs.append(combs)
+
+        # 跨分片串聯同一行五線譜軌跡
+        tracks: List[List[Tuple[float, float, float, float]]] = []
+        for combs in slice_combs:
+            for c in combs:
+                xc, y0, y4, sp = c
+                ymid = 0.5 * (y0 + y4)
+                best_t = None
+                best_dist = 1e9
+                for t in tracks:
+                    lx, ly0, ly4, lsp = t[-1]
+                    if xc <= lx or (xc - lx) > w * 0.42:
+                        continue
+                    if len(t) >= 2:
+                        slope = (
+                            0.5 * (t[-1][1] + t[-1][2]) - 0.5 * (t[-2][1] + t[-2][2])
+                        ) / max(1.0, t[-1][0] - t[-2][0])
+                        ypred = 0.5 * (ly0 + ly4) + slope * (xc - lx)
+                    else:
+                        ypred = 0.5 * (ly0 + ly4)
+                    if abs(ymid - ypred) <= lsp * 1.65 and abs(sp - lsp) <= lsp * 0.22:
+                        d = abs(ymid - ypred)
+                        if d < best_dist:
+                            best_dist = d
+                            best_t = t
+                if best_t is not None:
+                    best_t.append(c)
+                else:
+                    tracks.append([c])
+
+        valid = [t for t in tracks if len(t) >= 3]
+        if not valid:
+            return []
+
+        # 全頁譜線間距一致性約束（排除任何殘影假窄譜）
+        page_sp = float(np.median([np.median([c[3] for c in t]) for t in valid]))
+        valid = [t for t in valid if page_sp * 0.75 <= np.median([c[3] for c in t]) <= page_sp * 1.28]
+        valid.sort(key=lambda t: float(np.mean([c[1] for c in t])))
+
+        dedup: List[List[Tuple[float, float, float, float]]] = []
+        for t in valid:
+            ym = float(np.mean([0.5 * (c[1] + c[2]) for c in t]))
+            if dedup and abs(ym - float(np.mean([0.5 * (c[1] + c[2]) for c in dedup[-1]]))) < page_sp * 3.0:
+                if len(t) > len(dedup[-1]):
+                    dedup[-1] = t
+            else:
+                dedup.append(t)
+        return dedup
+
+    @staticmethod
+    def _straighten_staff_strip(
+        clean_gray: np.ndarray,
+        track: List[Tuple[float, float, float, float]],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float, int, int]:
+        """對單行五線譜區域執行獨立斜率搜尋 + 5齒梳狀微彎正交拉直，讓橫線歸 0° 且小節線歸 90°"""
+        h, w = clean_gray.shape[:2]
+        sp_est = float(np.median([c[3] for c in track]))
+        ymid_est = float(np.median([0.5 * (c[1] + c[2]) for c in track]))
+
+        half_band = int(round(max(sp_est * 6.8, w * 0.085)))
+        by1 = max(0, int(round(ymid_est - half_band)))
+        by2 = min(h, int(round(ymid_est + half_band)))
+        band_gray = clean_gray[by1:by2, :]
+        bh = band_gray.shape[0]
+        if bh < int(sp_est * 5):
+            pad = int(round(sp_est * 3.8))
+            z = np.zeros(w, dtype=np.float32)
+            return np.zeros((32, w), dtype=np.uint8), z, z, float(pad + 2 * sp_est), float(pad), float(pad + 4 * sp_est), sp_est, 0, w - 1
+
+        band_bin = ((band_gray < 212).astype(np.uint8))
+        hlen = max(12, w // 70)
+        band_horiz = cv2.morphologyEx(band_bin, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (hlen, 1)))
+
+        # 第一階段：全寬度垂直切變搜尋此行五線譜的真實獨立斜率 (5條全寬長線產生最高投影銳利度，不受短橫槓干擾)
+        sw_small = min(w, 650)
+        small_h_mat = cv2.resize(band_horiz.astype(np.float32), (sw_small, bh), interpolation=cv2.INTER_AREA)
+        xs_norm = np.linspace(-0.5, 0.5, sw_small, dtype=np.float32)
+
+        def eval_slope_sharpness(dy_total: float) -> float:
+            shifts = np.round(dy_total * xs_norm).astype(np.int32)
+            r_idx = np.arange(bh, dtype=np.int32)[:, None] + shifts[None, :]
+            valid_m = (r_idx >= 0) & (r_idx < bh)
+            warped = small_h_mat[np.clip(r_idx, 0, bh - 1), np.arange(sw_small)[None, :]] * valid_m
+            proj = np.sum(warped, axis=1)
+            return float(np.sum(np.diff(proj) ** 2))
+
+        max_dy = w * math.tan(math.radians(4.5))
+        best_dy = 0.0
+        best_score = -1.0
+        for dy_cand in np.linspace(-max_dy, max_dy, 45):
+            sc = eval_slope_sharpness(float(dy_cand))
+            if sc > best_score:
+                best_score = sc
+                best_dy = float(dy_cand)
+
+        for dy_cand in np.linspace(best_dy - max_dy / 18.0, best_dy + max_dy / 18.0, 21):
+            sc = eval_slope_sharpness(float(dy_cand))
+            if sc > best_score:
+                best_score = sc
+                best_dy = float(dy_cand)
+
+        x_all = np.arange(w, dtype=np.float64)
+        linear_offset = best_dy * ((x_all - w / 2.0) / max(1.0, float(w)))
+
+        pad = int(round(sp_est * 3.8))
+        shifts_full = np.round(linear_offset).astype(np.int32)
+        r_idx_f = np.arange(bh, dtype=np.int32)[:, None] + shifts_full[None, :]
+        valid_f = (r_idx_f >= 0) & (r_idx_f < bh)
+        aligned_horiz = band_horiz[np.clip(r_idx_f, 0, bh - 1), np.arange(w)[None, :]] * valid_f
+        full_proj = np.sum(aligned_horiz > 0, axis=1).astype(np.float32)
+        ps_full = np.convolve(full_proj, np.array([0.25, 0.6, 1.0, 0.6, 0.25], dtype=np.float32), mode="same")
+
+        # 5 條線梳狀濾波器搜尋：找出總能量最高的 5 等距長譜線（完全免疫短橫槓與漸強弱記號！）
+        best_comb_score = -1.0
+        best_y0_rel = float(bh / 2.0 - 2.0 * sp_est)
+        best_sp = sp_est
+        for sp_try in np.linspace(sp_est * 0.88, sp_est * 1.12, 17):
+            offsets_5 = np.round(np.arange(5) * sp_try).astype(np.int32)
+            max_y0 = bh - 1 - int(offsets_5[-1])
+            if max_y0 <= 1:
+                continue
+            y0_candidates = np.arange(1, max_y0)
+            comb_vals = np.sum(ps_full[y0_candidates[:, None] + offsets_5[None, :]], axis=1)
+            idx_max = int(np.argmax(comb_vals))
+            val_max = float(comb_vals[idx_max])
+            if val_max > best_comb_score:
+                best_comb_score = val_max
+                best_y0_rel = float(y0_candidates[idx_max])
+                best_sp = float(sp_try)
+
+        # 第二階段：細微書頁彎曲追蹤（限制局部微調量 |δy| <= 0.36*sp，絕不可能跳行或吸到橫槓）
+        max_local_delta = max(2, int(round(best_sp * 0.36)))
+        n_segs = 10
+        seg_xs = []
+        seg_deltas = []
+        offsets_5 = np.round(np.arange(5) * best_sp).astype(np.int32)
+        for s_i in range(n_segs):
+            sx0 = int(round(s_i * w / n_segs))
+            sx1 = int(round((s_i + 1) * w / n_segs))
+            seg_proj = np.sum(aligned_horiz[:, sx0:sx1] > 0, axis=1).astype(np.float32)
+            best_d = 0
+            best_d_val = -1.0
+            base_val = 0.0
+            for d_try in range(-max_local_delta, max_local_delta + 1):
+                rows_5 = int(round(best_y0_rel)) + d_try + offsets_5
+                if rows_5[0] < 0 or rows_5[-1] >= bh:
+                    continue
+                v = float(np.sum(seg_proj[rows_5]))
+                if d_try == 0:
+                    base_val = v
+                if v > best_d_val:
+                    best_d_val = v
+                    best_d = d_try
+            if best_d_val >= (sx1 - sx0) * 1.1 and best_d_val > base_val * 1.03:
+                seg_xs.append(0.5 * (sx0 + sx1))
+                seg_deltas.append(float(best_d))
+            else:
+                seg_xs.append(0.5 * (sx0 + sx1))
+                seg_deltas.append(0.0)
+
+        smooth_delta = np.interp(x_all, seg_xs, seg_deltas)
+        smooth_delta = cv2.GaussianBlur(smooth_delta.reshape(1, -1).astype(np.float32), (1, 91), 0).ravel()
+
+        y0_curve = float(by1) + best_y0_rel + linear_offset + smooth_delta
+        slope_arr = np.gradient(y0_curve).astype(np.float32)
+
+        strip_h = max(32, int(round(4.0 * best_sp + 2 * pad)))
+        center_dy = float(pad + 2.0 * best_sp)
+        y_shift = (y0_curve - pad).astype(np.float32)
+
+        dy_grid = np.arange(strip_h, dtype=np.float32)[:, None]
+        x_grid = np.arange(w, dtype=np.float32)[None, :]
+        # 正交展開：水平線拉平的同時，垂直小節線與符幹亦轉正為 90° 垂直
+        map_x = x_grid - slope_arr[None, :] * (dy_grid - center_dy)
+        map_y = y_shift[None, :] + dy_grid
+        strip_gray = cv2.remap(
+            clean_gray, map_x, map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=255,
+        )
+        strip_bin = ((strip_gray < 210).astype(np.uint8)) * 255
+
+        horiz = cv2.morphologyEx(
+            strip_bin, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, w // 35), 1))
+        )
+        row_proj = np.sum(horiz > 0, axis=1).astype(np.float32)
+
+        refined_lines = []
+        for k_line in range(5):
+            exp_y = pad + k_line * best_sp
+            r0 = max(0, int(round(exp_y - max(2.0, best_sp * 0.25))))
+            r1 = min(strip_h, int(round(exp_y + max(2.0, best_sp * 0.25))) + 1)
+            w_seg = row_proj[r0:r1]
+            if np.sum(w_seg) > w * 0.15:
+                refined_lines.append(float(np.average(np.arange(r0, r1), weights=w_seg)))
+            else:
+                refined_lines.append(float(exp_y))
+        sy1 = refined_lines[0]
+        sy2 = refined_lines[4]
+        sp = (sy2 - sy1) / 4.0
+
+        col_proj = np.sum(horiz[max(0, int(sy1 - 3)):min(strip_h, int(sy2 + 4)), :] > 0, axis=0)
+        xs_col = np.where(col_proj >= 2)[0]
+        xl = int(xs_col[0]) if len(xs_col) > 0 else 0
+        xr = int(xs_col[-1]) if len(xs_col) > 0 else w - 1
+
+        return strip_bin, y_shift, slope_arr, center_dy, sy1, sy2, sp, xl, xr
 
     @staticmethod
     def _classify_and_assign_durations(
@@ -512,19 +816,18 @@ class ScoreAnalyzer:
         return durations, note_types
 
     @staticmethod
-    def _estimate_rest_bar_count(binary: np.ndarray, bar: _HorizBar, y_top: float, sp: float) -> int:
+    def _estimate_rest_bar_count(strip_bin: np.ndarray, bar: _HorizBar, sy1: float, sp: float) -> int:
         """檢查多小節休止橫條正上方的數字區域並辨識休止小節數"""
-        h, w = binary.shape[:2]
-        ry1 = max(0, int(y_top - sp * 2.8))
-        ry2 = min(h, int(min(bar.y_center - sp * 0.45, y_top + sp * 1.15)))
+        sh, sw = strip_bin.shape[:2]
+        ry1 = max(0, int(sy1 - sp * 2.8))
+        ry2 = min(sh, int(min(bar.y_center - sp * 0.45, sy1 + sp * 1.15)))
         rx1 = max(0, int(bar.x1))
-        rx2 = min(w, int(bar.x2))
+        rx2 = min(sw, int(bar.x2))
         if rx2 <= rx1 + 4 or ry2 <= ry1 + 4:
             return 1
 
-        patch = binary[ry1:ry2, rx1:rx2].copy()
+        patch = strip_bin[ry1:ry2, rx1:rx2].copy()
         pw = patch.shape[1]
-        # 僅濾除橫跨休止橫條寬度 >= 72% 的五線譜細橫線，完整保留細體或襯線數字筆畫
         line_w = max(8, int(pw * 0.72))
         line_mask = cv2.morphologyEx(patch, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (line_w, 1)))
         vert_keep = cv2.morphologyEx(patch, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(round(sp * 0.30))))))
@@ -540,17 +843,13 @@ class ScoreAnalyzer:
         if dh < int(sp * 0.7) or dw < int(sp * 0.35):
             return 2
 
-        # 音樂排版字體數字結構判別（避免 OpenCV 無襯線字型把粗襯線 "2" 誤認為 "8"）：
-        # "2" 的特徵：底部 22% 為寬平實心橫底（填充率 >= 0.72），且下半部無封閉圓孔
         bot_band = digit_roi[max(0, int(dh * 0.78)):, :]
         bot_fill = float(np.mean(bot_band > 0)) if bot_band.size > 0 else 0.0
 
-        # 計算內部封閉白孔數 (holes)：8 有 2 孔，6/4/0 有 1 孔，2/3/5/7 通常 0 孔（或頂部極小彎孔）
         padded = cv2.copyMakeBorder(digit_roi, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
-        _, hier = cv2.findContours(padded, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        contours, hier = cv2.findContours(padded, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         holes_bot = 0
         if hier is not None:
-            contours, _ = cv2.findContours(padded, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
             for c_i, h_i in enumerate(hier[0]):
                 if h_i[3] >= 0 and cv2.contourArea(contours[c_i]) >= 4:
                     _, hy, _, hh = cv2.boundingRect(contours[c_i])
@@ -580,111 +879,31 @@ class ScoreAnalyzer:
         return best_digit if best_score >= 0.50 else 2
 
     @staticmethod
-    def _estimate_skew(clean_gray: np.ndarray) -> float:
-        """透過水平投影梯度平方和最大化精準偵測五線譜傾角"""
-        sh, sw = clean_gray.shape[:2]
-        if sw < 80 or sh < 80:
-            return 0.0
-        scale = 600.0 / float(sw)
-        small_h = max(60, int(round(sh * scale)))
-        small = cv2.resize(clean_gray, (600, small_h), interpolation=cv2.INTER_AREA)
-        b = (small < 180).astype(np.uint8)
-        bh, bw = b.shape[:2]
-        center = (bw / 2.0, bh / 2.0)
-
-        best_a = 0.0
-        best_v = -1.0
-        for a in np.arange(-6.0, 6.01, 0.3):
-            M = cv2.getRotationMatrix2D(center, float(a), 1.0)
-            rot = cv2.warpAffine(b, M, (bw, bh), flags=cv2.INTER_NEAREST)
-            proj = np.sum(rot, axis=1, dtype=np.float32)
-            v = float(np.sum(np.diff(proj) ** 2))
-            if v > best_v:
-                best_v = v
-                best_a = float(a)
-
-        for a in np.arange(best_a - 0.35, best_a + 0.36, 0.05):
-            M = cv2.getRotationMatrix2D(center, float(a), 1.0)
-            rot = cv2.warpAffine(b, M, (bw, bh), flags=cv2.INTER_NEAREST)
-            proj = np.sum(rot, axis=1, dtype=np.float32)
-            v = float(np.sum(np.diff(proj) ** 2))
-            if v > best_v:
-                best_v = v
-                best_a = float(a)
-
-        return best_a
-
-    @staticmethod
-    def _detect_staves(
-        binary: np.ndarray, w: int, h: int
-    ) -> List[Tuple[float, float, float, int, int, List[float]]]:
-        """偵測所有 5 條線組成的五線譜行"""
-        horiz_len = max(18, w // 35)
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_len, 1))
-        horiz = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
-
-        row_proj = np.sum(horiz > 0, axis=1)
-        line_rows = np.where(row_proj > w * 0.20)[0]
-        if len(line_rows) < 5:
-            return []
-
-        lines: List[float] = []
-        start = prev = int(line_rows[0])
-        for r in line_rows[1:]:
-            r = int(r)
-            if r > prev + 2:
-                seg = np.arange(start, prev + 1)
-                lines.append(float(np.average(seg, weights=row_proj[seg])))
-                start = r
-            prev = r
-        seg = np.arange(start, prev + 1)
-        lines.append(float(np.average(seg, weights=row_proj[seg])))
-
-        staves = []
-        i = 0
-        while i + 4 < len(lines):
-            group = lines[i:i + 5]
-            spacings = np.diff(group)
-            med = float(np.median(spacings))
-            if med > 3.0 and np.all(np.abs(spacings - med) < max(3.0, med * 0.35)):
-                y1 = max(0, int(group[0] - 2))
-                y2 = min(h, int(group[4] + 2))
-                col_proj = np.sum(horiz[y1:y2, :] > 0, axis=0)
-                xs = np.where(col_proj >= 3)[0]
-                x_left = int(xs[0]) if len(xs) else 0
-                x_right = int(xs[-1]) if len(xs) else w - 1
-                if x_right - x_left > w * 0.25:
-                    staves.append((group[0], group[4], med, x_left, x_right, group))
-                i += 5
-            else:
-                i += 1
-        return staves
-
-    @staticmethod
     def _detect_notes_and_bars(
-        binary: np.ndarray,
-        y_top: float,
-        y_bot: float,
+        strip_bin: np.ndarray,
+        sy1: float,
+        sy2: float,
         sp: float,
         xl: int,
         xr: int,
     ) -> Tuple[List[_RawNote], List[_HorizBar], float]:
-        """移除細橫線與細直幹，自動略過譜頭拍號 (2/4)，切出每顆獨立音符與橫槓"""
-        h, w = binary.shape[:2]
-        pad = int(sp * 3.5)
-        ry1 = max(0, int(y_top - pad))
-        ry2 = min(h, int(y_bot + pad))
-        roi = binary[ry1:ry2, xl:xr].copy()
-        sy1 = float(y_top - ry1)
-        sy2 = float(y_bot - ry1)
+        """在已水平拉直的 strip_bin 上略過譜頭拍號 (2/4)，切出每顆獨立音符與橫槓"""
+        roi = strip_bin[:, xl:xr].copy()
 
-        # 1. 量測此行五線譜線實際粗細，全域抹除所有細橫線（五線譜線 + 加線翅膀 + 保持音短線），並以原圖遮罩回補 1px
-        staff_band = roi[max(0, int(sy1 - 3)):min(roi.shape[0], int(sy2 + 4)), :]
+        # 1. 量測此行 5 條五線譜線實際第 85 百分位線寬，全域抹除所有細橫線（五線譜線 + 加線翅膀），並以原圖遮罩回補 1px
         h_lines_only = cv2.morphologyEx(
-            staff_band, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, roi.shape[1] // 14), 1))
+            roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, roi.shape[1] // 14), 1))
         )
-        avg_line_t = float(np.sum(h_lines_only > 0)) / max(1.0, 5.0 * roi.shape[1])
-        max_thin = max(2, min(int(round(sp * 0.36)), int(round(avg_line_t + 0.55))))
+        line_thicks = []
+        for k_l in range(5):
+            yc_l = int(round(sy1 + k_l * sp))
+            band_l = h_lines_only[max(0, yc_l - 4):min(roi.shape[0], yc_l + 5), :]
+            cnts = np.sum(band_l > 0, axis=0)
+            nz = cnts[cnts > 0]
+            if len(nz) > 10:
+                line_thicks.append(float(np.percentile(nz, 96)))
+        est_line_t = float(np.median(line_thicks)) if line_thicks else (sp * 0.25)
+        max_thin = max(2, min(int(round(sp * 0.42)), int(round(est_line_t))))
         vert_keep = cv2.morphologyEx(roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max_thin + 1)))
         vert_keep = cv2.bitwise_and(roi, cv2.dilate(vert_keep, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))))
 
@@ -698,10 +917,8 @@ class ScoreAnalyzer:
             bw = int(hstats[lbl, cv2.CC_STAT_WIDTH])
             bh = int(hstats[lbl, cv2.CC_STAT_HEIGHT])
             if bx < sp * 3.8 and bh > sp * 4.8:
-                # 高音譜號
                 header_skip = max(header_skip, bx + bw + sp * 0.6)
             elif sp * 2.8 <= bx <= sp * 8.5 and sp * 0.85 <= bw <= sp * 2.3:
-                # 拍號（如 2/4）：完全落在五線譜上下界內，且上下半譜皆有高密度數字筆畫（沒有伸出譜外的細長符幹）
                 if by >= sy1 - sp * 0.55 and (by + bh) <= sy2 + sp * 0.55:
                     x0, x1 = max(0, bx - 2), min(scan_w, bx + bw + 2)
                     up_ink = int(np.sum(vert_keep[max(0, int(sy1)):min(roi.shape[0], int(sy1 + 1.9 * sp)), x0:x1] > 0))
@@ -711,35 +928,46 @@ class ScoreAnalyzer:
 
         header_end_x = min(float(xr) - sp, float(xl) + header_skip)
 
-        # 3. 提取細直符幹與小節線 (pure_stems)，以及長橫槓/多小節休止條 (beam_mask)
+        # 3. 提取細直符幹與小節線 (pure_stems)，以及長橫槓/多小節休止條 (beams_mask)
         v_stems = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(6, int(round(sp * 1.4))))))
         horiz_thick = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(round(sp * 0.50))), 1)))
         pure_stems = cv2.subtract(v_stems, horiz_thick)
 
         beam_w = max(8, int(round(sp * 1.65)))
         beam_h = max(max_thin + 1, int(round(sp * 0.30)))
-        beams_mask = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h)))
+        raw_beams = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h)))
 
-        num_b, _, bstats, bcent = cv2.connectedComponentsWithStats(beams_mask)
+        num_b, blabels, bstats, bcent = cv2.connectedComponentsWithStats(raw_beams)
+        beams_mask = np.zeros_like(raw_beams)
         horiz_bars: List[_HorizBar] = []
+        min_beam_stem_gap = max(5, int(round(sp * 0.65)))
         for lbl in range(1, num_b):
             bx = int(bstats[lbl, cv2.CC_STAT_LEFT])
+            by = int(bstats[lbl, cv2.CC_STAT_TOP])
             bw = int(bstats[lbl, cv2.CC_STAT_WIDTH])
             bh = int(bstats[lbl, cv2.CC_STAT_HEIGHT])
             cy = float(bcent[lbl][1])
+            # 真實連槓必連接 >=2 根獨立符幹，或多小節休止橫條寬度 >= 2.25*sp；排除單顆符頭連帶殘留譜線被誤切！
+            sx0, sx1 = max(0, bx - 2), min(roi.shape[1], bx + bw + 2)
+            sy0, sy1_b = max(0, by - int(sp * 0.8)), min(roi.shape[0], by + bh + int(sp * 0.8))
+            b_scols = np.where(np.sum(pure_stems[sy0:sy1_b, sx0:sx1] > 0, axis=0) >= 3)[0]
+            b_nstems = (1 + int(np.sum(np.diff(b_scols) > min_beam_stem_gap))) if len(b_scols) > 0 else 0
+            if bw < sp * 2.25 and b_nstems < 2:
+                continue
+            beams_mask[blabels == lbl] = 255
             in_mid = (sy1 + sp * 1.15) <= cy <= (sy2 - sp * 1.15)
             horiz_bars.append(
                 _HorizBar(
                     x1=float(xl + bx),
                     x2=float(xl + bx + bw),
-                    y_center=float(ry1 + cy),
+                    y_center=cy,
                     width=float(bw),
                     height=float(bh),
                     in_staff_mid=in_mid,
                 )
             )
 
-        # 4. 同時減去長橫槓與細直符幹，讓每顆符頭 100% 獨立分離！
+        # 4. 同時減去長橫槓與細直符幹，讓每顆符頭 100% 獨立分離
         roi_clean = cv2.subtract(vert_keep, cv2.dilate(beams_mask, np.ones((2, 2), np.uint8)))
         roi_clean = cv2.subtract(roi_clean, pure_stems)
 
@@ -765,26 +993,25 @@ class ScoreAnalyzer:
             area_ratio = area / max(1.0, sp * sp)
             if not (
                 (sp * 0.36 <= ch <= sp * 1.58)
-                and (sp * 0.42 <= cw <= sp * 1.88)
-                and (0.50 <= aspect <= 2.15)
+                and (sp * 0.42 <= cw <= sp * 2.25)
+                and (0.50 <= aspect <= 2.30)
                 and (area_ratio >= 0.20)
                 and ((sy1 - sp * 2.5) <= cy <= (sy2 + sp * 2.5))
             ):
                 continue
 
-            # 計算此候選區塊連接了幾根獨立符幹 (stems_touched)
             sx0, sx1 = max(0, nx - 2), min(roi.shape[1], nx + cw + 2)
             sy0, sy1_p = max(0, ny - int(sp * 0.8)), min(roi.shape[0], ny + ch + int(sp * 0.8))
             stem_cols = np.where(np.sum(pure_stems[sy0:sy1_p, sx0:sx1] > 0, axis=0) >= 3)[0]
-            n_stems = (1 + int(np.sum(np.diff(stem_cols) > 3))) if len(stem_cols) > 0 else 0
+            min_stem_gap = max(5, int(round(sp * 0.65)))
+            n_stems = (1 + int(np.sum(np.diff(stem_cols) > min_stem_gap))) if len(stem_cols) > 0 else 0
 
-            # 跨接 >=2 根符幹者必為短連槓（如雙裝飾音上方的短橫槓），記錄為橫槓而非音符！
-            if n_stems >= 2:
+            if n_stems >= 2 and (cw >= sp * 1.15 or area_ratio < 0.68):
                 horiz_bars.append(
                     _HorizBar(
                         x1=float(xl + nx),
                         x2=float(xl + nx + cw),
-                        y_center=float(ry1 + cy),
+                        y_center=cy,
                         width=float(cw),
                         height=float(ch),
                         in_staff_mid=False,
@@ -793,14 +1020,13 @@ class ScoreAnalyzer:
                 continue
 
             is_grace_cand = area_ratio < 0.72
-            # 小面積區塊 (area_ratio < 0.72) 若沒有碰到任何符幹，必為雜訊或文字殘片而非裝飾音！
             if is_grace_cand and n_stems == 0:
                 continue
 
             candidates.append(
                 _RawNote(
                     x=xl + cx,
-                    y=ry1 + cy,
+                    y=cy,
                     width=float(cw),
                     area_ratio=area_ratio,
                     is_grace=is_grace_cand,
@@ -808,14 +1034,12 @@ class ScoreAnalyzer:
                 )
             )
 
-        # 5. 過濾單根符幹尾端的 16 分音符短勾槓 (partial hook) 與單顆裝飾音上方的斜線符尾 (grace flag)：
-        #    注意：為解決 threshold 210 下短勾槓略大於 0.72 的情況，放寬短勾槓面積上限至 0.90
+        # 5. 過濾單根符幹尾端的 16 分音符短勾槓與單顆裝飾音上方的斜線小旗標
         main_cands = [c for c in candidates if c.area_ratio >= 0.90]
         grace_cands = [c for c in candidates if c.area_ratio < 0.90]
         filtered_cands: List[_RawNote] = []
         for c in candidates:
             if c.area_ratio < 0.90:
-                # 5a. 若緊貼在某顆大主音符同一根符幹的另一端 -> 16 分短勾槓
                 attached_main = [
                     m for m in main_cands
                     if abs(c.x - m.x) <= sp * 1.35 and abs(c.y - m.y) >= sp * 1.50
@@ -823,7 +1047,6 @@ class ScoreAnalyzer:
                 if attached_main:
                     short_hooks.append((c.x, c.y))
                     continue
-                # 5b. 若緊貼在另一顆裝飾音的正上方 (|dx| <= 0.85*sp 且在上方 >= 1.0*sp) -> 單顆倚音上方的斜線小旗標！
                 lower_grace = [
                     g for g in grace_cands
                     if g is not c and abs(c.x - g.x) <= sp * 0.85 and (g.y - c.y) >= sp * 1.0
@@ -859,7 +1082,6 @@ class ScoreAnalyzer:
                     and ((sy1 - sp * 2.0) <= hcy <= (sy2 + sp * 2.0))
                 ):
                     abs_x = xl + hcx
-                    abs_y = ry1 + hcy
                     if all(abs(abs_x - c.x) > sp * 0.65 for c in candidates if not c.is_grace):
                         sx0 = max(0, int(hcx - sp * 0.9))
                         sx1 = min(roi.shape[1], int(hcx + sp * 0.9))
@@ -872,7 +1094,7 @@ class ScoreAnalyzer:
                         candidates.append(
                             _RawNote(
                                 x=abs_x,
-                                y=abs_y,
+                                y=hcy,
                                 width=float(ow),
                                 area_ratio=1.1,
                                 is_grace=False,
@@ -905,7 +1127,7 @@ class ScoreAnalyzer:
             else:
                 merged.append(cand)
 
-        # 8. 計算符尾橫槓數量（含長橫槓與 16 分短勾槓）與附點
+        # 8. 計算符尾橫槓數量与附點
         num_dots, _, dstats, dcent = cv2.connectedComponentsWithStats(roi_clean)
         dot_pts = []
         for dlbl in range(1, num_dots):
@@ -917,7 +1139,7 @@ class ScoreAnalyzer:
                 and 2 <= dh <= max(4, int(sp * 0.45))
                 and sp * sp * 0.03 <= da <= sp * sp * 0.16
             ):
-                dot_pts.append((xl + float(dcent[dlbl][0]), ry1 + float(dcent[dlbl][1])))
+                dot_pts.append((xl + float(dcent[dlbl][0]), float(dcent[dlbl][1])))
 
         for note in merged:
             if note.is_grace:
@@ -950,27 +1172,45 @@ class ScoreAnalyzer:
 
     @staticmethod
     def _detect_barlines(
-        binary: np.ndarray,
-        y_top: float,
-        y_bot: float,
+        strip_bin: np.ndarray,
+        sy1: float,
+        sy2: float,
         sp: float,
         xl: int,
         xr: int,
         note_pts: List[Tuple[float, float]],
+        horiz_bars: List[_HorizBar],
     ) -> List[float]:
-        """偵測五線譜內的小節線（自動排除音符符幹）"""
-        iy1 = max(0, int(y_top))
-        iy2 = min(binary.shape[0], int(y_bot) + 1)
+        """在水平拉直的五線譜帶內偵測小節線（嚴格排除音符符幹與連槓端點）"""
+        iy1 = max(0, int(round(sy1)))
+        iy2 = min(strip_bin.shape[0], int(round(sy2)) + 1)
         staff_h = max(1, iy2 - iy1)
-        if staff_h < 8:
+        if staff_h < 12:
             return []
 
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(staff_h * 0.90))))
-        v_lines = cv2.morphologyEx(binary[iy1:iy2, xl:xr], cv2.MORPH_OPEN, v_kernel)
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(4, int(staff_h * 0.88))))
+        v_lines = cv2.morphologyEx(strip_bin[iy1:iy2, xl:xr], cv2.MORPH_OPEN, v_kernel)
         v_proj = np.sum(v_lines > 0, axis=0)
         bx = np.where(v_proj > staff_h * 0.85)[0]
         if len(bx) == 0:
             return []
+
+        def is_valid_barline(cand_x: float) -> bool:
+            if any(abs(cand_x - nx) <= sp * 0.88 for nx, _ in note_pts):
+                return False
+            # 真實小節線止於第一線與第五線；若該垂直線本身直接向上或向下延伸超過 0.65*sp（例如音符符幹），則非小節線
+            cx_i = int(np.clip(round(cand_x), 1, strip_bin.shape[1] - 2))
+            up_r1 = max(0, iy1 - int(round(sp * 0.85)))
+            up_r2 = max(0, iy1 - 2)
+            dn_r1 = min(strip_bin.shape[0], iy2 + 2)
+            dn_r2 = min(strip_bin.shape[0], iy2 + int(round(sp * 0.85)))
+            if up_r2 > up_r1 + 2:
+                if float(np.mean(np.max(strip_bin[up_r1:up_r2, cx_i - 1:cx_i + 2], axis=1) > 0)) > 0.75:
+                    return False
+            if dn_r2 > dn_r1 + 2:
+                if float(np.mean(np.max(strip_bin[dn_r1:dn_r2, cx_i - 1:cx_i + 2], axis=1) > 0)) > 0.75:
+                    return False
+            return True
 
         barlines: List[float] = []
         b_start = b_prev = int(bx[0])
@@ -978,12 +1218,12 @@ class ScoreAnalyzer:
             x = int(x)
             if x > b_prev + max(5, int(sp * 1.0)):
                 cand_x = xl + (b_start + b_prev) / 2.0
-                if all(abs(cand_x - nx) > sp * 0.95 for nx, _ in note_pts):
+                if is_valid_barline(cand_x):
                     barlines.append(cand_x)
                 b_start = x
             b_prev = x
         cand_x = xl + (b_start + b_prev) / 2.0
-        if all(abs(cand_x - nx) > sp * 0.95 for nx, _ in note_pts):
+        if is_valid_barline(cand_x):
             barlines.append(cand_x)
         return barlines
 
@@ -1001,16 +1241,3 @@ class ScoreAnalyzer:
         midi = (octave + 1) * 12 + semitones[deg]
         midi = max(36, min(96, midi))
         return midi, f"{names[deg]}{octave}"
-
-    @staticmethod
-    def _map_back(
-        x: float, y: float, M_inv: Optional[np.ndarray], w: int, h: int
-    ) -> Tuple[float, float]:
-        if M_inv is not None:
-            ox = float(M_inv[0, 0] * x + M_inv[0, 1] * y + M_inv[0, 2])
-            oy = float(M_inv[1, 0] * x + M_inv[1, 1] * y + M_inv[1, 2])
-        else:
-            ox, oy = float(x), float(y)
-        nx = max(0.0, min(1.0, ox / max(1.0, float(w))))
-        ny = max(0.0, min(1.0, oy / max(1.0, float(h))))
-        return nx, ny

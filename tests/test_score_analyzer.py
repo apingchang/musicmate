@@ -167,6 +167,36 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertFalse(res.events[1].is_rest)
         self.assertGreater(res.events[1].x_norm, 0.38)
 
+    def test_perspective_keystone_multi_staff_independent_tilt(self):
+        """驗證同一頁上下行五線譜具有相反透視傾斜角（上行 -2.0°、下行 +1.5°）時，仍能逐行拉直並精準辨識休止 2 小節與音符"""
+        s_top = np.full((260, 1100, 3), 240, dtype=np.uint8)
+        sp = 12
+        sy = 120
+        for i in range(5):
+            cv2.line(s_top, (80, sy + i * sp), (1020, sy + i * sp), (25, 25, 25), 2)
+        cv2.putText(s_top, "2", (135, sy + 2 * sp - 1), cv2.FONT_HERSHEY_TRIPLEX, 0.72, (25, 25, 25), 2)
+        cv2.putText(s_top, "4", (135, sy + 4 * sp - 1), cv2.FONT_HERSHEY_TRIPLEX, 0.72, (25, 25, 25), 2)
+        cv2.rectangle(s_top, (220, sy + 2 * sp - 3), (285, sy + 2 * sp + 3), (20, 20, 20), -1)
+        cv2.putText(s_top, "2", (244, sy - 4), cv2.FONT_HERSHEY_TRIPLEX, 0.72, (20, 20, 20), 2)
+        cv2.line(s_top, (360, sy), (360, sy + 4 * sp), (25, 25, 25), 3)
+        cv2.line(s_top, (1020, sy), (1020, sy + 4 * sp), (25, 25, 25), 2)
+        for nx in (480, 660, 840):
+            cv2.ellipse(s_top, (nx, sy + 2 * sp), (8, 6), -18, 0, 360, (20, 20, 20), -1)
+            cv2.line(s_top, (nx + 7, sy - sp), (nx + 7, sy + 2 * sp), (20, 20, 20), 2)
+
+        # 上行旋轉 +2.0°（左低右高），下行旋轉 -1.5°（左高右低）模擬手機翻拍透視變形
+        s1 = cv2.warpAffine(s_top, cv2.getRotationMatrix2D((550, 130), 2.0, 1.0), (1100, 260), borderValue=(240, 240, 240))
+        s2 = cv2.warpAffine(s_top, cv2.getRotationMatrix2D((550, 130), -1.5, 1.0), (1100, 260), borderValue=(240, 240, 240))
+        keystone_page = np.vstack([s1, s2])
+
+        res = self.analyzer.analyze_pages([keystone_page], beats_per_measure=2.0)
+        self.assertEqual(len(res.pages[0].staves), 2)
+        # 驗證第一行與第二行的譜線高度皆未被壓扁（各約 4*sp / 520 ≈ 0.092）
+        for st in res.pages[0].staves:
+            self.assertGreater(st.staff_height_norm, 0.075)
+            self.assertEqual(st.measures[0].rest_measures, 2)
+            self.assertEqual(len(st.measures[1].notes), 3)
+
     def test_measure_step_and_note_step_calibration_ui(self):
         """驗證逐小節播放、逐音符步進與詳細音符資訊列及偵測標記疊層"""
         rgb = _create_synthetic_score_rgb()

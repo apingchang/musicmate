@@ -121,25 +121,51 @@ class ScorePageWidget(QWidget):
         st = self._active_staff
         sp_px = max(5.0, st.spacing_norm * h)
         pad_y = sp_px * 1.6
-        band_top = max(4.0, st.y_top_norm * h - pad_y)
-        band_bot = min(h - 4.0, st.y_bot_norm * h + pad_y)
+
+        # 3a. 整行五線譜暖黃淡色底光（自動貼合傾斜或微彎五線譜軌跡）
+        if st.curve_xs_norm and len(st.curve_xs_norm) >= 2:
+            top_pts = []
+            bot_pts = []
+            for idx_pt, xn in enumerate(st.curve_xs_norm):
+                yt_n, yb_n = st.y_range_at(xn)
+                px = xn * w
+                if idx_pt == 0:
+                    px = max(4.0, px - sp_px * 0.8)
+                elif idx_pt == len(st.curve_xs_norm) - 1:
+                    px = min(w - 4.0, px + sp_px * 0.8)
+                top_pts.append(QPointF(px, max(4.0, yt_n * h - pad_y)))
+                bot_pts.append(QPointF(px, min(h - 4.0, yb_n * h + pad_y)))
+            band_poly = QPolygonF(top_pts + list(reversed(bot_pts)))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(255, 224, 102, 55)))
+            painter.drawPolygon(band_poly)
+
+            l_yt, l_yb = st.y_range_at(st.x_left_norm)
+            l_top = max(4.0, l_yt * h - pad_y)
+            l_bot = min(h - 4.0, l_yb * h + pad_y)
+            staff_left = max(4.0, st.x_left_norm * w - sp_px * 0.8)
+            painter.setBrush(QBrush(QColor(235, 160, 20, 185)))
+            painter.drawRoundedRect(QRectF(staff_left, l_top, 4.0, max(16.0, l_bot - l_top)), 2.0, 2.0)
+        else:
+            band_top_s = max(4.0, st.y_top_norm * h - pad_y)
+            band_bot_s = min(h - 4.0, st.y_bot_norm * h + pad_y)
+            band_h_s = max(16.0, band_bot_s - band_top_s)
+            staff_left = max(4.0, st.x_left_norm * w - sp_px * 0.8)
+            staff_right = min(w - 4.0, st.x_right_norm * w + sp_px * 0.8)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(255, 224, 102, 55)))
+            painter.drawRoundedRect(QRectF(staff_left, band_top_s, max(20.0, staff_right - staff_left), band_h_s), 6.0, 6.0)
+            painter.setBrush(QBrush(QColor(235, 160, 20, 185)))
+            painter.drawRoundedRect(QRectF(staff_left, band_top_s, 4.0, band_h_s), 2.0, 2.0)
+
+        # 3b. 半透明垂直光條 + 紅色中心細線（隨游標所在 x 對齊該處五線譜上下高度）
+        c_yt_n, c_yb_n = st.y_range_at(self._cursor_x_norm)
+        band_top = max(4.0, c_yt_n * h - pad_y)
+        band_bot = min(h - 4.0, c_yb_n * h + pad_y)
         band_h = max(16.0, band_bot - band_top)
-
-        staff_left = max(4.0, st.x_left_norm * w - sp_px * 0.8)
-        staff_right = min(w - 4.0, st.x_right_norm * w + sp_px * 0.8)
-        staff_w = max(20.0, staff_right - staff_left)
-
-        # 3a. 整行五線譜暖黃淡色底光
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(QColor(255, 224, 102, 55)))
-        painter.drawRoundedRect(QRectF(staff_left, band_top, staff_w, band_h), 6.0, 6.0)
-
-        painter.setBrush(QBrush(QColor(235, 160, 20, 185)))
-        painter.drawRoundedRect(QRectF(staff_left, band_top, 4.0, band_h), 2.0, 2.0)
-
-        # 3b. 半透明垂直光條 + 紅色中心細線
         cx = self._cursor_x_norm * w
         bar_w = max(10.0, sp_px * 1.35)
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(231, 76, 60, 46)))
         painter.drawRoundedRect(QRectF(cx - bar_w / 2.0, band_top, bar_w, band_h), 4.0, 4.0)
 
@@ -182,31 +208,50 @@ class ScorePageWidget(QWidget):
 
         for st in self._page_analysis.staves:
             sp_px = max(5.0, st.spacing_norm * h)
-            yt = st.y_top_norm * h
-            yb = st.y_bot_norm * h
 
-            # 五線譜外框（淡綠細虛線）
-            pen_staff = QPen(QColor(16, 185, 129, 120), 1.0, Qt.PenStyle.DashLine)
+            # 五線譜外框（淡綠細虛線，自動貼合傾斜或彎曲五線譜）
+            pen_staff = QPen(QColor(16, 185, 129, 135), 1.1, Qt.PenStyle.DashLine)
             painter.setPen(pen_staff)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(QRectF(st.x_left_norm * w, yt, (st.x_right_norm - st.x_left_norm) * w, yb - yt))
+            if st.curve_xs_norm and len(st.curve_xs_norm) >= 2:
+                t_pts = [QPointF(xn * w, st.y_range_at(xn)[0] * h) for xn in st.curve_xs_norm]
+                b_pts = [QPointF(xn * w, st.y_range_at(xn)[1] * h) for xn in reversed(st.curve_xs_norm)]
+                painter.drawPolygon(QPolygonF(t_pts + b_pts))
+            else:
+                painter.drawRect(
+                    QRectF(
+                        st.x_left_norm * w,
+                        st.y_top_norm * h,
+                        (st.x_right_norm - st.x_left_norm) * w,
+                        (st.y_bot_norm - st.y_top_norm) * h,
+                    )
+                )
 
             for m in st.measures:
                 mx1 = m.x_start_norm * w
                 mx2 = m.x_end_norm * w
+                m_yt1, m_yb1 = st.y_range_at(m.x_start_norm)
+                yt1_px, yb1_px = m_yt1 * h, m_yb1 * h
                 # 小節起點藍色虛線與小節號 M#
-                painter.setPen(QPen(QColor(37, 99, 235, 165), 1.2, Qt.PenStyle.DashLine))
-                painter.drawLine(QPointF(mx1, yt - sp_px * 1.2), QPointF(mx1, yb + sp_px * 0.8))
+                painter.setPen(QPen(QColor(37, 99, 235, 175), 1.2, Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(mx1, yt1_px - sp_px * 1.2), QPointF(mx1, yb1_px + sp_px * 0.8))
 
                 m_title = f"M{m.measure_number}" if m.rest_measures <= 1 else f"M{m.measure_number}..{m.measure_number + m.rest_measures - 1}"
-                painter.setPen(QColor(29, 78, 216, 220))
-                painter.drawText(QPointF(mx1 + 3.0, yt - sp_px * 1.3), m_title)
+                painter.setPen(QColor(29, 78, 216, 225))
+                painter.drawText(QPointF(mx1 + 3.0, yt1_px - sp_px * 1.3), m_title)
 
-                # 若為休止小節，畫淡橘色區塊標示
+                # 若為休止小節，沿五線譜傾角畫淡橘色區塊標示
                 if m.rest_measures > 0:
-                    painter.setPen(QPen(QColor(234, 88, 12, 160), 1.2, Qt.PenStyle.DotLine))
-                    painter.setBrush(QBrush(QColor(251, 146, 60, 45)))
-                    painter.drawRoundedRect(QRectF(mx1 + 2, yt, max(8.0, mx2 - mx1 - 4), yb - yt), 4.0, 4.0)
+                    m_yt2, m_yb2 = st.y_range_at(m.x_end_norm)
+                    rest_poly = QPolygonF([
+                        QPointF(mx1 + 2, yt1_px),
+                        QPointF(max(mx1 + 6, mx2 - 2), m_yt2 * h),
+                        QPointF(max(mx1 + 6, mx2 - 2), m_yb2 * h),
+                        QPointF(mx1 + 2, yb1_px),
+                    ])
+                    painter.setPen(QPen(QColor(234, 88, 12, 165), 1.2, Qt.PenStyle.DotLine))
+                    painter.setBrush(QBrush(QColor(251, 146, 60, 48)))
+                    painter.drawPolygon(rest_poly)
 
                 # 標示每個偵測到的音符中心點與音名
                 for ev in m.notes:
@@ -214,6 +259,7 @@ class ScorePageWidget(QWidget):
                         continue
                     ex = ev.x_norm * w
                     ey = ev.y_norm * h
+                    _, ev_yb_n = st.y_range_at(ev.x_norm)
                     if ev.is_grace:
                         color = QColor(147, 51, 234, 215)  # 紫色：裝飾音
                         r = 3.2
@@ -227,7 +273,7 @@ class ScorePageWidget(QWidget):
                     painter.setBrush(QBrush(color))
                     painter.drawEllipse(QPointF(ex, ey), r, r)
                     painter.setPen(color)
-                    painter.drawText(QPointF(ex - 7.0, yb + sp_px * 2.1), ev.note_name)
+                    painter.drawText(QPointF(ex - 7.0, ev_yb_n * h + sp_px * 2.1), ev.note_name)
 
 
 class ScoreViewWidget(QWidget):
@@ -1183,7 +1229,7 @@ class AutoScrollPage(QWidget):
 
         best_staff = min(
             page_res.staves,
-            key=lambda s: abs(((s.y_top_norm + s.y_bot_norm) / 2.0) - y_norm),
+            key=lambda s: abs((sum(s.y_range_at(x_norm)) / 2.0) - y_norm),
         )
         staff_events = [
             ev for ev in page_res.events
