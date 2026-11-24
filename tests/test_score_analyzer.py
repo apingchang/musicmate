@@ -117,6 +117,56 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertEqual(res_hi.events[0].rest_measures, 2)
         self.assertEqual(res_hi.events[0].note_type, "休止 2 小節")
 
+    def test_shaded_paper_with_time_sig_2_4_and_2_measure_rest(self):
+        """驗證泛黃漸層底色樂譜先去底色強化後，開頭譜號與 2/4 拍號不會誤判為音符，且第一小節精準辨識為休止 2 小節"""
+        h, w = 360, 1000
+        # 建立泛黃且左暗右亮的不均勻紙張底色 + 模擬背面淡淡透字雜訊
+        x_grad = np.linspace(195, 238, w, dtype=np.float32)[None, :]
+        bg_r = np.clip(x_grad + 6, 0, 255).astype(np.uint8)
+        bg_g = np.clip(x_grad + 2, 0, 255).astype(np.uint8)
+        bg_b = np.clip(x_grad - 18, 0, 255).astype(np.uint8)
+        img = np.stack([np.broadcast_to(bg_r, (h, w)), np.broadcast_to(bg_g, (h, w)), np.broadcast_to(bg_b, (h, w))], axis=-1).copy()
+        cv2.rectangle(img, (120, 80), (420, 96), (205, 200, 185), -1)  # 淡透字陰影
+
+        sp = 12
+        staff_y = 150
+        for i in range(5):
+            cv2.line(img, (80, staff_y + i * sp), (920, staff_y + i * sp), (35, 35, 35), 2)
+        y_top, y_bot = staff_y, staff_y + 4 * sp
+
+        # 繪製高音譜號（穿透上下界）+ 2/4 拍號（位於 dx ≈ 5.2 * sp）
+        cv2.ellipse(img, (104, staff_y + 2 * sp), (9, 32), 8, 0, 360, (30, 30, 30), 2)
+        cv2.line(img, (105, staff_y - 16), (105, y_bot + 18), (30, 30, 30), 2)
+        cv2.putText(img, "2", (136, staff_y + 2 * sp - 1), cv2.FONT_HERSHEY_TRIPLEX, 0.75, (28, 28, 28), 2)
+        cv2.putText(img, "4", (136, y_bot - 1), cv2.FONT_HERSHEY_TRIPLEX, 0.75, (28, 28, 28), 2)
+
+        # 第一小節：休止 2 小節粗橫條 + 上方數字 "2" + 小節線
+        cv2.rectangle(img, (215, staff_y + 2 * sp - 3), (275, staff_y + 2 * sp + 3), (28, 28, 28), -1)
+        cv2.putText(img, "2", (237, staff_y - 4), cv2.FONT_HERSHEY_TRIPLEX, 0.72, (28, 28, 28), 2)
+        cv2.line(img, (340, y_top), (340, y_bot), (30, 30, 30), 3)
+        cv2.line(img, (920, y_top), (920, y_bot), (30, 30, 30), 2)
+
+        # 第二段小節（M3）：2 個獨立四分音符（含音幹）
+        for nx, ny in ((450, staff_y + sp + sp // 2), (620, staff_y + 2 * sp)):
+            cv2.ellipse(img, (nx, ny), (7, 5), -18, 0, 360, (25, 25, 25), -1)
+            cv2.line(img, (nx - 6, ny), (nx - 6, ny + 3 * sp), (25, 25, 25), 2)
+
+        enh = ScoreAnalyzer.enhance_score_rgb(img)
+        # 驗證原本泛黃左暗右亮底色 + 淡透字區域已被洗白為純白 (>= 252)
+        self.assertGreater(float(np.mean(enh[20:105, 50:450])), 252.0)
+
+        res = self.analyzer.analyze_pages([img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        self.assertGreaterEqual(len(res.events), 3)
+        # 事件 #1 必須是「休止 2 小節」，絕不能把 2/4 或 2 誤判成音符
+        ev0 = res.events[0]
+        self.assertTrue(ev0.is_rest)
+        self.assertEqual(ev0.rest_measures, 2)
+        self.assertEqual(ev0.note_type, "休止 2 小節")
+        # 後續 2 個音符皆在 x=340 小節線之後
+        self.assertFalse(res.events[1].is_rest)
+        self.assertGreater(res.events[1].x_norm, 0.38)
+
     def test_measure_step_and_note_step_calibration_ui(self):
         """驗證逐小節播放、逐音符步進與詳細音符資訊列及偵測標記疊層"""
         rgb = _create_synthetic_score_rgb()
@@ -153,7 +203,10 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertIsNotNone(page._stop_at_beat)
         page._stop_playing()
 
-        # 3. 測試開啟「顯示偵測標記」渲染無誤
+        # 3. 測試開啟「顯示偵測標記」與切換「去底色強化」渲染無誤
+        self.assertTrue(page.enhance_view_chk.isChecked())
+        page.enhance_view_chk.setChecked(False)
+        page.enhance_view_chk.setChecked(True)
         page.debug_overlay_chk.setChecked(True)
         pm_grab = page.score_view.page_labels[0].grab()
         self.assertFalse(pm_grab.isNull())

@@ -1,12 +1,12 @@
-"""樂譜影像結構分析引擎 (OpenCV OMR Lite v3 - 尺度不變與完整音符分類版)
+"""樂譜影像結構分析引擎 (OpenCV OMR Lite v4 - 去底色強化與精準符頭切分版)
 
-針對各種解析度的拍照樂譜 (JPG/PNG/WEBP) 與 PDF 樂譜進行純 Python / OpenCV 影像分析：
-1. 自動標準化分析解析度 (寬度歸一化至 1150 px)，確保高解析 300 DPI PDF 與手機照片表現完全一致
-2. 自動傾斜偵測與座標校正 (Deskew via HoughLinesP)
-3. 五線譜行 (Staff) 與自適應線寬抹除
-4. 多小節休止符 (H-bar + 上方數字) 優先過濾，絕不把休止數字 "2" 誤判為音符
-5. 實心符頭、空心符頭 (二分/全音符)、小裝飾音 (倚音)、附點與符尾橫槓 (Beam) 完整偵測
-6. 產出每個音符的詳細除錯/校準資訊：第幾行、第幾小節、小節內第幾個音符、音符時值種類、音名、MIDI、頻率與拍數
+核心處理流程：
+1. 去底色與對比強化 (Division Illumination Normalization)：消除泛黃紙色、手機拍照陰影與背面透字
+2. 尺度標準化 (寬度統一至 1200 px) 與水平投影梯度最大化傾斜校正 (Deskew)
+3. 五線譜偵測與譜頭自動跳過 (自動辨識並略過譜號 Clef 與拍號如 2/4，絕不誤判為音符)
+4. 全域細橫線抹除 (移除五線譜線與上/下加線翅膀，同時 100% 保留加線上的高音符頭如 A5/B5/C6)
+5. 細直符幹剝離 (Stem Removal) + 跨雙幹短橫槓過濾 (Stem-Bridging Filter)：切出每顆獨立音符與雙裝飾音
+6. 反覆記號雙點 (|: / :|) 與多小節休止符 (H-bar + 數字 2..8) 精準辨識
 """
 
 from dataclasses import dataclass, field
@@ -18,12 +18,12 @@ import numpy as np
 @dataclass
 class NoteEvent:
     """單一演奏音符、裝飾音或休止事件（座標皆為原圖歸一化 0.0~1.0）"""
-    event_index: int          # 全曲 1-based 總序號
-    page_index: int           # 0-based 頁碼
-    staff_index: int          # 本頁 0-based 五線譜行索引
-    measure_number: int       # 全曲 1-based 小節編號
-    note_index_in_measure: int  # 小節內 1-based 第幾個音符
-    notes_in_measure: int     # 該小節內總事件數
+    event_index: int
+    page_index: int
+    staff_index: int
+    measure_number: int
+    note_index_in_measure: int
+    notes_in_measure: int
     x_norm: float
     y_norm: float
     beat_offset: float
@@ -36,7 +36,7 @@ class NoteEvent:
     beam_count: int = 0
     midi_note: int = 0
     note_name: str = ""
-    note_type: str = ""       # 例如 "四分音符 (1/4)", "十六分音符 (1/16)", "裝飾音", "休止 2 小節"
+    note_type: str = ""
 
     @property
     def freq_hz(self) -> float:
@@ -106,19 +106,12 @@ class ScoreAnalysis:
                 return staves[staff_index]
         return None
 
-    def get_measure(self, measure_number: int) -> Optional[MeasureInfo]:
-        for p in self.pages:
-            for s in p.staves:
-                for m in s.measures:
-                    if m.measure_number <= measure_number <= m.measure_number + max(0, m.rest_measures - 1):
-                        return m
-        return None
-
 
 @dataclass
 class _RawNote:
     x: float
     y: float
+    width: float
     area_ratio: float
     is_grace: bool = False
     is_hollow: bool = False
@@ -138,16 +131,41 @@ class _HorizBar:
 
 
 class ScoreAnalyzer:
-    """純 OpenCV 尺度不變樂譜結構、休止符、裝飾音與音符分類分析器"""
+    """純 OpenCV 去底色強化與精準音符切分引擎"""
 
-    TARGET_ANALYSIS_WIDTH = 1150
+    TARGET_WIDTH = 1200
+
+    @staticmethod
+    def enhance_score_gray(gray: np.ndarray) -> np.ndarray:
+        """去底色與對比強化：消除泛黃紙張、拍照陰影漸層與背面透字，輸出純白底深黑墨跡灰階圖"""
+        h, w = gray.shape[:2]
+        ref_dim = max(w, h)
+        # 膨脹核大於實心符頭與多小節休止橫條厚度（1200px 時約 15px），避免黑塊被當背景掏空
+        k_dil = max(15, int(round(ref_dim / 80)) | 1)
+        k_blur = max(51, int(round(ref_dim / 22)) | 1)
+        bg = cv2.dilate(gray, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil)))
+        bg = cv2.GaussianBlur(bg, (k_blur, k_blur), 0)
+        bg = np.maximum(bg, 16)
+        norm = cv2.divide(gray, bg, scale=255)
+        # 壓制 >220 的紙張底色與背面透字至純白 255，同時將墨跡拉深至純黑
+        enhanced = np.clip((norm.astype(np.float32) - 132.0) * (255.0 / (220.0 - 132.0)), 0.0, 255.0)
+        return enhanced.astype(np.uint8)
+
+    @classmethod
+    def enhance_score_rgb(cls, rgb: np.ndarray) -> np.ndarray:
+        """將輸入彩色樂譜去底色強化為清爽白底黑字 RGB 影像（供 UI 顯示）"""
+        if rgb.ndim == 3:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = rgb
+        clean = cls.enhance_score_gray(gray)
+        return cv2.cvtColor(clean, cv2.COLOR_GRAY2RGB)
 
     def analyze_pages(
         self,
         rgb_images: List[np.ndarray],
         beats_per_measure: float = 4.0,
     ) -> ScoreAnalysis:
-        """分析整份樂譜的所有頁面並建立連貫的節拍時間軸"""
         analysis = ScoreAnalysis(beats_per_measure=beats_per_measure)
         cumulative_beat = 0.0
         measure_counter = 0
@@ -178,7 +196,6 @@ class ScoreAnalyzer:
         start_measure_num: int,
         start_event_idx: int,
     ) -> Tuple[PageAnalysis, float, int, int]:
-        """分析單頁 RGB 影像（自動縮放至標準分析寬度以確保尺度一致性）"""
         if rgb.ndim == 3:
             orig_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         else:
@@ -188,46 +205,38 @@ class ScoreAnalyzer:
         if orig_h < 100 or orig_w < 100:
             return PageAnalysis(page_index, orig_w, orig_h, 0.0), start_beat, start_measure_num, start_event_idx
 
-        # 0. 若為高解析影像 (>1250 px) 則等比例縮放至 1080 px，確保尺度一致且高速；過小影像 (<750 px) 適度放大
-        if orig_w > 1250:
-            scale = 1080.0 / float(orig_w)
-            w = 1080
+        # 1. 標準化分析寬度至 1200 px，確保所有形態學核心尺度一致
+        if abs(orig_w - self.TARGET_WIDTH) > 80:
+            scale = self.TARGET_WIDTH / float(orig_w)
+            w = self.TARGET_WIDTH
             h = max(100, int(round(orig_h * scale)))
-            gray = cv2.resize(orig_gray, (w, h), interpolation=cv2.INTER_AREA)
-        elif orig_w < 750:
-            scale = 1000.0 / float(orig_w)
-            w = 1000
-            h = max(100, int(round(orig_h * scale)))
-            gray = cv2.resize(orig_gray, (w, h), interpolation=cv2.INTER_CUBIC)
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            gray = cv2.resize(orig_gray, (w, h), interpolation=interp)
         else:
             gray = orig_gray
             h, w = orig_h, orig_w
 
-        # 1. 偵測傾斜角度並產生校正圖
-        skew = self._estimate_skew(gray)
+        # 2. 先執行去底色與對比強化！消除紙色、陰影與透字
+        clean_gray = self.enhance_score_gray(gray)
+
+        # 3. 偵測傾斜角度並校正
+        skew = self._estimate_skew(clean_gray)
         if abs(skew) > 0.05:
             M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), skew, 1.0)
             M_inv = cv2.invertAffineTransform(M)
-            gray_d = cv2.warpAffine(
-                gray, M, (w, h),
+            clean_d = cv2.warpAffine(
+                clean_gray, M, (w, h),
                 flags=cv2.INTER_LINEAR,
                 borderValue=255,
             )
         else:
             M_inv = None
-            gray_d = gray
+            clean_d = clean_gray
 
-        # 2. 自適應二值化
-        block_size = max(35, int(min(w, h) / 20) | 1)
-        block_size = min(block_size, 65)
-        binary = cv2.adaptiveThreshold(
-            gray_d, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            block_size, 12,
-        )
+        # 去底色後 >220 之紙張底色與淡透印皆為純白 255；門檻 210 完整保留細五線譜線、十六分音符與裝飾音符頭
+        binary = ((clean_d < 210).astype(np.uint8)) * 255
 
-        # 3. 偵測五線譜行
+        # 4. 偵測五線譜行
         raw_staves = self._detect_staves(binary, w, h)
 
         page_res = PageAnalysis(
@@ -242,16 +251,25 @@ class ScoreAnalyzer:
         cur_ev_idx = start_event_idx
 
         for s_idx, (y_top, y_bot, sp, xl, xr, line_ys) in enumerate(raw_staves):
-            # 4. 偵測橫槓 (Beams / 多小節休止條)、音符符頭 (實心/空心/裝飾音/附點) 與小節線
-            raw_notes, horiz_bars = self._detect_notes_and_bars(
-                binary, y_top, y_bot, sp, xl, xr, line_ys
+            # 5. 自動偵測譜頭區（譜號 + 調號 + 拍號如 2/4）結束位置，並切分所有獨立音符與橫槓
+            raw_notes, horiz_bars, header_end_x = self._detect_notes_and_bars(
+                binary, y_top, y_bot, sp, xl, xr
             )
             main_note_pts = [(n.x, n.y) for n in raw_notes if not n.is_grace]
             barlines = self._detect_barlines(binary, y_top, y_bot, sp, xl, xr, main_note_pts)
 
-            clef_end = min(xr - sp, xl + sp * 4.2)
-            valid_bars = [bx for bx in barlines if bx > clef_end]
-            seg_edges = [clef_end] + valid_bars
+            # 6. 過濾緊鄰小節線的反覆記號雙點 (|: / :|，寬度 < 0.85*sp 且距小節線 < 1.45*sp)
+            if barlines:
+                raw_notes = [
+                    n for n in raw_notes
+                    if not (
+                        n.width < sp * 0.85
+                        and any(abs(n.x - bx) < sp * 1.45 for bx in barlines)
+                    )
+                ]
+
+            valid_bars = [bx for bx in barlines if bx > header_end_x + sp * 1.2]
+            seg_edges = [header_end_x] + valid_bars
             if not valid_bars or (xr - seg_edges[-1]) > sp * 3.0:
                 seg_edges.append(float(xr))
 
@@ -260,7 +278,7 @@ class ScoreAnalyzer:
                 if ex - clean_edges[-1] >= sp * 2.2:
                     clean_edges.append(ex)
             if len(clean_edges) < 2:
-                clean_edges = [clef_end, float(xr)]
+                clean_edges = [header_end_x, float(xr)]
 
             tl_x, tl_y = self._map_back(xl, y_top, M_inv, w, h)
             br_x, br_y = self._map_back(xr, y_bot, M_inv, w, h)
@@ -277,32 +295,36 @@ class ScoreAnalyzer:
                 barlines_norm=barlines_norm,
             )
 
-            # 5. 建立每個小節與節拍時間軸
+            # 7. 建立每個小節與節拍時間軸
             for m_i in range(len(clean_edges) - 1):
                 mx1 = clean_edges[m_i]
                 mx2 = clean_edges[m_i + 1]
 
-                # 尋找此小節內的五線譜中央粗橫條（H-bar 多小節休止符）
+                # 尋找此小節內的五線譜中央粗橫條（H-bar 多小節休止符：須位於小節內部且非整條譜線）
+                m_width = max(1.0, mx2 - mx1)
                 mid_rest_bars = [
                     b for b in horiz_bars
                     if b.in_staff_mid
-                    and b.width >= sp * 2.5
-                    and b.x1 >= mx1 - sp * 0.8
-                    and b.x2 <= mx2 + sp * 0.8
+                    and sp * 2.2 <= b.width <= min(sp * 9.5, m_width * 0.80)
+                    and b.x1 >= mx1 + sp * 0.5
+                    and b.x2 <= mx2 - sp * 0.5
                 ]
 
                 m_notes_all = [n for n in raw_notes if mx1 <= n.x <= mx2]
 
-                # 若存在中央粗橫條，先排除橫條正上方/重疊區的所有假符頭（例如粗體數字 "2"）
+                # 若存在中央休止粗橫條，僅排除橫條正上方且無符幹的休止數字（如跨在第一線間的 "2"），絕不刪除有符幹的真實音符！
                 if mid_rest_bars:
                     rest_bar = max(mid_rest_bars, key=lambda b: b.width)
-                    notes_outside_bar = [
+                    real_notes_in_m = [
                         n for n in m_notes_all
-                        if not (rest_bar.x1 - sp * 0.6 <= n.x <= rest_bar.x2 + sp * 0.6)
-                        and not n.is_grace
+                        if n.has_stem
+                        or n.y >= rest_bar.y_center
+                        or not (rest_bar.x1 - sp * 0.6 <= n.x <= rest_bar.x2 + sp * 0.6)
                     ]
-                    if len(notes_outside_bar) == 0:
-                        m_notes_all = []  # 確認整小節為多小節休止！
+                    if len(real_notes_in_m) == 0:
+                        m_notes_all = []
+                    else:
+                        rest_bar = None
                 else:
                     rest_bar = None
 
@@ -419,7 +441,7 @@ class ScoreAnalyzer:
     def _classify_and_assign_durations(
         notes: List[_RawNote], mx2: float, sp: float, beats_per_measure: float
     ) -> Tuple[List[float], List[str]]:
-        """分類每個音符的樂理種類（全音/二分/四分/八分/十六分/附點/裝飾音）並分配拍數"""
+        """分類每個音符的樂理種類並分配拍數"""
         n_count = len(notes)
         if n_count == 0:
             return [], []
@@ -434,7 +456,7 @@ class ScoreAnalyzer:
         if not main_indices:
             return [beats_per_measure / n_count] * n_count, note_types
 
-        grace_dur = min(0.10, (beats_per_measure * 0.25) / max(1, len(grace_indices)))
+        grace_dur = min(0.10, (beats_per_measure * 0.24) / max(1, len(grace_indices)))
         remaining_beats = max(0.25, beats_per_measure - grace_dur * len(grace_indices))
 
         main_weights = []
@@ -491,39 +513,59 @@ class ScoreAnalyzer:
 
     @staticmethod
     def _estimate_rest_bar_count(binary: np.ndarray, bar: _HorizBar, y_top: float, sp: float) -> int:
-        """檢查多小節休止橫條正上方的數字區域並辨識休止小節數（常見 2~8 小節）"""
+        """檢查多小節休止橫條正上方的數字區域並辨識休止小節數"""
         h, w = binary.shape[:2]
-        # 數字可能跨在第一線(y_top)上下：檢查 y_top - 2.8*sp 到 y_top + 1.1*sp
         ry1 = max(0, int(y_top - sp * 2.8))
-        ry2 = min(h, int(min(bar.y_center - sp * 0.5, y_top + sp * 1.1)))
+        ry2 = min(h, int(min(bar.y_center - sp * 0.45, y_top + sp * 1.15)))
         rx1 = max(0, int(bar.x1))
         rx2 = min(w, int(bar.x2))
         if rx2 <= rx1 + 4 or ry2 <= ry1 + 4:
             return 1
 
         patch = binary[ry1:ry2, rx1:rx2].copy()
-        # 清除穿過數字的頂部五線譜橫線
-        top_rel = int(round(y_top - ry1))
-        for dy in (-1, 0, 1):
-            r = top_rel + dy
-            if 2 <= r < patch.shape[0] - 2:
-                pure = (patch[r - 2, :] == 0) & (patch[r + 2, :] == 0)
-                patch[r, pure] = 0
+        pw = patch.shape[1]
+        # 僅濾除橫跨休止橫條寬度 >= 72% 的五線譜細橫線，完整保留細體或襯線數字筆畫
+        line_w = max(8, int(pw * 0.72))
+        line_mask = cv2.morphologyEx(patch, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (line_w, 1)))
+        vert_keep = cv2.morphologyEx(patch, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(round(sp * 0.30))))))
+        vert_keep = cv2.dilate(vert_keep, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)))
+        patch_clean = cv2.subtract(patch, cv2.subtract(line_mask, vert_keep))
 
-        ys, xs = np.where(patch > 0)
-        if len(xs) < max(6, int(sp * sp * 0.28)):
+        ys, xs = np.where(patch_clean > 0)
+        if len(xs) < max(5, int(sp * sp * 0.16)):
             return 1
 
-        # 擷取數字 bounding box 並與標準字型模板 "2"~"8" 比對，預設回傳 2
-        digit_roi = patch[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        digit_roi = patch_clean[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
         dh, dw = digit_roi.shape[:2]
-        if dh < int(sp * 0.8) or dw < int(sp * 0.4):
+        if dh < int(sp * 0.7) or dw < int(sp * 0.35):
+            return 2
+
+        # 音樂排版字體數字結構判別（避免 OpenCV 無襯線字型把粗襯線 "2" 誤認為 "8"）：
+        # "2" 的特徵：底部 22% 為寬平實心橫底（填充率 >= 0.72），且下半部無封閉圓孔
+        bot_band = digit_roi[max(0, int(dh * 0.78)):, :]
+        bot_fill = float(np.mean(bot_band > 0)) if bot_band.size > 0 else 0.0
+
+        # 計算內部封閉白孔數 (holes)：8 有 2 孔，6/4/0 有 1 孔，2/3/5/7 通常 0 孔（或頂部極小彎孔）
+        padded = cv2.copyMakeBorder(digit_roi, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=0)
+        _, hier = cv2.findContours(padded, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        holes_bot = 0
+        if hier is not None:
+            contours, _ = cv2.findContours(padded, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            for c_i, h_i in enumerate(hier[0]):
+                if h_i[3] >= 0 and cv2.contourArea(contours[c_i]) >= 4:
+                    _, hy, _, hh = cv2.boundingRect(contours[c_i])
+                    if (hy + hh / 2.0) > padded.shape[0] * 0.52:
+                        holes_bot += 1
+
+        if bot_fill >= 0.70 and holes_bot == 0:
             return 2
 
         norm_digit = cv2.resize(digit_roi, (24, 32), interpolation=cv2.INTER_AREA)
         best_digit = 2
         best_score = -1.0
         for d in range(2, 9):
+            if d == 8 and holes_bot == 0:
+                continue
             tmpl = np.zeros((32, 24), dtype=np.uint8)
             cv2.putText(tmpl, str(d), (2, 28), cv2.FONT_HERSHEY_TRIPLEX, 1.0, 255, 2)
             tys, txs = np.where(tmpl > 0)
@@ -535,29 +577,23 @@ class ScoreAnalyzer:
                 best_score = sc
                 best_digit = d
 
-        return best_digit if best_score >= 0.42 else 2
+        return best_digit if best_score >= 0.50 else 2
 
     @staticmethod
-    def _estimate_skew(gray: np.ndarray) -> float:
-        """透過水平投影梯度平方和最大化（Projection Profile Sharpness）精準偵測五線譜傾角"""
-        sh, sw = gray.shape[:2]
+    def _estimate_skew(clean_gray: np.ndarray) -> float:
+        """透過水平投影梯度平方和最大化精準偵測五線譜傾角"""
+        sh, sw = clean_gray.shape[:2]
         if sw < 80 or sh < 80:
             return 0.0
         scale = 600.0 / float(sw)
         small_h = max(60, int(round(sh * scale)))
-        small = cv2.resize(gray, (600, small_h), interpolation=cv2.INTER_AREA)
-        b = cv2.adaptiveThreshold(
-            small, 1,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            25, 10,
-        )
+        small = cv2.resize(clean_gray, (600, small_h), interpolation=cv2.INTER_AREA)
+        b = (small < 180).astype(np.uint8)
         bh, bw = b.shape[:2]
         center = (bw / 2.0, bh / 2.0)
 
         best_a = 0.0
         best_v = -1.0
-        # 粗搜尋 -6.0° ~ +6.0° (步長 0.3°)
         for a in np.arange(-6.0, 6.01, 0.3):
             M = cv2.getRotationMatrix2D(center, float(a), 1.0)
             rot = cv2.warpAffine(b, M, (bw, bh), flags=cv2.INTER_NEAREST)
@@ -567,7 +603,6 @@ class ScoreAnalyzer:
                 best_v = v
                 best_a = float(a)
 
-        # 細搜尋 best_a ± 0.35° (步長 0.05°)
         for a in np.arange(best_a - 0.35, best_a + 0.36, 0.05):
             M = cv2.getRotationMatrix2D(center, float(a), 1.0)
             rot = cv2.warpAffine(b, M, (bw, bh), flags=cv2.INTER_NEAREST)
@@ -633,9 +668,8 @@ class ScoreAnalyzer:
         sp: float,
         xl: int,
         xr: int,
-        line_ys: List[float],
-    ) -> Tuple[List[_RawNote], List[_HorizBar]]:
-        """去除五線譜線後，偵測橫槓、實心符頭、空心符頭（二分/全音符）、裝飾音與附點"""
+    ) -> Tuple[List[_RawNote], List[_HorizBar], float]:
+        """移除細橫線與細直幹，自動略過譜頭拍號 (2/4)，切出每顆獨立音符與橫槓"""
         h, w = binary.shape[:2]
         pad = int(sp * 3.5)
         ry1 = max(0, int(y_top - pad))
@@ -644,21 +678,47 @@ class ScoreAnalyzer:
         sy1 = float(y_top - ry1)
         sy2 = float(y_bot - ry1)
 
-        # 1. 尺度自適應抹除純五線譜橫線
-        half_t = max(1, int(round(sp * 0.20)))
-        guard = half_t + 1
-        for ly in line_ys:
-            ly_rel = int(round(ly - ry1))
-            if guard <= ly_rel < roi.shape[0] - guard:
-                pure = (roi[ly_rel - guard, :] == 0) & (roi[ly_rel + guard, :] == 0)
-                for dy in range(-half_t, half_t + 1):
-                    roi[ly_rel + dy, pure] = 0
+        # 1. 量測此行五線譜線實際粗細，全域抹除所有細橫線（五線譜線 + 加線翅膀 + 保持音短線），並以原圖遮罩回補 1px
+        staff_band = roi[max(0, int(sy1 - 3)):min(roi.shape[0], int(sy2 + 4)), :]
+        h_lines_only = cv2.morphologyEx(
+            staff_band, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(18, roi.shape[1] // 14), 1))
+        )
+        avg_line_t = float(np.sum(h_lines_only > 0)) / max(1.0, 5.0 * roi.shape[1])
+        max_thin = max(2, min(int(round(sp * 0.36)), int(round(avg_line_t + 0.55))))
+        vert_keep = cv2.morphologyEx(roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max_thin + 1)))
+        vert_keep = cv2.bitwise_and(roi, cv2.dilate(vert_keep, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))))
 
-        # 2. 提取粗橫槓（符尾連槓 Beams 與多小節休止橫條）
+        # 2. 自動偵測譜頭結束位置（略過高音譜號 Clef 與拍號如 2/4、3/4、4/4）
+        header_skip = sp * 4.2
+        scan_w = min(roi.shape[1], int(sp * 9.5))
+        num_h, _, hstats, _ = cv2.connectedComponentsWithStats(vert_keep[:, :scan_w])
+        for lbl in range(1, num_h):
+            bx = int(hstats[lbl, cv2.CC_STAT_LEFT])
+            by = int(hstats[lbl, cv2.CC_STAT_TOP])
+            bw = int(hstats[lbl, cv2.CC_STAT_WIDTH])
+            bh = int(hstats[lbl, cv2.CC_STAT_HEIGHT])
+            if bx < sp * 3.8 and bh > sp * 4.8:
+                # 高音譜號
+                header_skip = max(header_skip, bx + bw + sp * 0.6)
+            elif sp * 2.8 <= bx <= sp * 8.5 and sp * 0.85 <= bw <= sp * 2.3:
+                # 拍號（如 2/4）：完全落在五線譜上下界內，且上下半譜皆有高密度數字筆畫（沒有伸出譜外的細長符幹）
+                if by >= sy1 - sp * 0.55 and (by + bh) <= sy2 + sp * 0.55:
+                    x0, x1 = max(0, bx - 2), min(scan_w, bx + bw + 2)
+                    up_ink = int(np.sum(vert_keep[max(0, int(sy1)):min(roi.shape[0], int(sy1 + 1.9 * sp)), x0:x1] > 0))
+                    lo_ink = int(np.sum(vert_keep[max(0, int(sy1 + 2.1 * sp)):min(roi.shape[0], int(sy2)), x0:x1] > 0))
+                    if up_ink >= sp * sp * 0.40 and lo_ink >= sp * sp * 0.40:
+                        header_skip = max(header_skip, bx + bw + sp * 0.8)
+
+        header_end_x = min(float(xr) - sp, float(xl) + header_skip)
+
+        # 3. 提取細直符幹與小節線 (pure_stems)，以及長橫槓/多小節休止條 (beam_mask)
+        v_stems = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(6, int(round(sp * 1.4))))))
+        horiz_thick = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(round(sp * 0.50))), 1)))
+        pure_stems = cv2.subtract(v_stems, horiz_thick)
+
         beam_w = max(8, int(round(sp * 1.65)))
-        beam_h = max(2, int(round(sp * 0.26)))
-        beam_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
-        beams_mask = cv2.morphologyEx(roi, cv2.MORPH_OPEN, beam_kernel)
+        beam_h = max(max_thin + 1, int(round(sp * 0.30)))
+        beams_mask = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h)))
 
         num_b, _, bstats, bcent = cv2.connectedComponentsWithStats(beams_mask)
         horiz_bars: List[_HorizBar] = []
@@ -679,56 +739,102 @@ class ScoreAnalyzer:
                 )
             )
 
-        # 3. 實心符頭與裝飾音偵測
-        roi_no_beams = cv2.subtract(roi, cv2.dilate(beams_mask, np.ones((3, 3), np.uint8)))
+        # 4. 同時減去長橫槓與細直符幹，讓每顆符頭 100% 獨立分離！
+        roi_clean = cv2.subtract(vert_keep, cv2.dilate(beams_mask, np.ones((2, 2), np.uint8)))
+        roi_clean = cv2.subtract(roi_clean, pure_stems)
+
         nh_w = max(3, int(round(sp * 0.50)))
-        nh_h = max(3, int(round(sp * 0.45)))
-        nh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (nh_w, nh_h))
-        nh_mask = cv2.morphologyEx(roi_no_beams, cv2.MORPH_OPEN, nh_kernel)
+        nh_h = max(3, int(round(sp * 0.44)))
+        nh_mask = cv2.morphologyEx(roi_clean, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (nh_w, nh_h)))
 
         num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(nh_mask)
         candidates: List[_RawNote] = []
-        clef_skip = int(sp * 4.2)
+        short_hooks: List[Tuple[float, float]] = []
 
         for lbl in range(1, num_labels):
+            nx = int(stats[lbl, cv2.CC_STAT_LEFT])
+            ny = int(stats[lbl, cv2.CC_STAT_TOP])
             cw = int(stats[lbl, cv2.CC_STAT_WIDTH])
             ch = int(stats[lbl, cv2.CC_STAT_HEIGHT])
             area = int(stats[lbl, cv2.CC_STAT_AREA])
             cx, cy = float(centroids[lbl][0]), float(centroids[lbl][1])
-            if cx < clef_skip:
+            if cx < header_skip:
                 continue
+
             aspect = cw / max(1.0, float(ch))
             area_ratio = area / max(1.0, sp * sp)
-            if (
-                (sp * 0.36 <= ch <= sp * 1.60)
-                and (sp * 0.40 <= cw <= sp * 1.85)
+            if not (
+                (sp * 0.36 <= ch <= sp * 1.58)
+                and (sp * 0.42 <= cw <= sp * 1.88)
                 and (0.50 <= aspect <= 2.15)
-                and (area_ratio >= 0.18)
+                and (area_ratio >= 0.20)
                 and ((sy1 - sp * 2.5) <= cy <= (sy2 + sp * 2.5))
             ):
-                is_grace_cand = area_ratio < 0.72
-                if is_grace_cand:
-                    # 真正的裝飾音必有向上（或向下）的細直符幹；藉此100%排除圓滑線(slur)弧頂與雜訊！
-                    gx1 = max(0, int(cx - sp * 0.5))
-                    gx2 = min(roi.shape[1], int(cx + sp * 0.85))
-                    gy1 = max(0, int(cy - sp * 2.6))
-                    gy2 = min(roi.shape[0], int(cy + sp * 0.5))
-                    g_patch = roi[gy1:gy2, gx1:gx2]
-                    if g_patch.size == 0 or int(np.max(np.sum(g_patch > 0, axis=0))) < max(4, int(sp * 1.25)):
-                        continue
+                continue
 
-                candidates.append(
-                    _RawNote(
-                        x=xl + cx,
-                        y=ry1 + cy,
-                        area_ratio=area_ratio,
-                        is_grace=is_grace_cand,
-                        is_hollow=False,
+            # 計算此候選區塊連接了幾根獨立符幹 (stems_touched)
+            sx0, sx1 = max(0, nx - 2), min(roi.shape[1], nx + cw + 2)
+            sy0, sy1_p = max(0, ny - int(sp * 0.8)), min(roi.shape[0], ny + ch + int(sp * 0.8))
+            stem_cols = np.where(np.sum(pure_stems[sy0:sy1_p, sx0:sx1] > 0, axis=0) >= 3)[0]
+            n_stems = (1 + int(np.sum(np.diff(stem_cols) > 3))) if len(stem_cols) > 0 else 0
+
+            # 跨接 >=2 根符幹者必為短連槓（如雙裝飾音上方的短橫槓），記錄為橫槓而非音符！
+            if n_stems >= 2:
+                horiz_bars.append(
+                    _HorizBar(
+                        x1=float(xl + nx),
+                        x2=float(xl + nx + cw),
+                        y_center=float(ry1 + cy),
+                        width=float(cw),
+                        height=float(ch),
+                        in_staff_mid=False,
                     )
                 )
+                continue
 
-        # 4. 空心符頭（二分音符 / 全音符）偵測：尋找譜內具有封閉橢圓白孔且外框非寬大圓滑線的輪廓
-        closed_roi = cv2.morphologyEx(roi_no_beams, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
+            is_grace_cand = area_ratio < 0.72
+            # 小面積區塊 (area_ratio < 0.72) 若沒有碰到任何符幹，必為雜訊或文字殘片而非裝飾音！
+            if is_grace_cand and n_stems == 0:
+                continue
+
+            candidates.append(
+                _RawNote(
+                    x=xl + cx,
+                    y=ry1 + cy,
+                    width=float(cw),
+                    area_ratio=area_ratio,
+                    is_grace=is_grace_cand,
+                    is_hollow=False,
+                )
+            )
+
+        # 5. 過濾單根符幹尾端的 16 分音符短勾槓 (partial hook) 與單顆裝飾音上方的斜線符尾 (grace flag)：
+        #    注意：為解決 threshold 210 下短勾槓略大於 0.72 的情況，放寬短勾槓面積上限至 0.90
+        main_cands = [c for c in candidates if c.area_ratio >= 0.90]
+        grace_cands = [c for c in candidates if c.area_ratio < 0.90]
+        filtered_cands: List[_RawNote] = []
+        for c in candidates:
+            if c.area_ratio < 0.90:
+                # 5a. 若緊貼在某顆大主音符同一根符幹的另一端 -> 16 分短勾槓
+                attached_main = [
+                    m for m in main_cands
+                    if abs(c.x - m.x) <= sp * 1.35 and abs(c.y - m.y) >= sp * 1.50
+                ]
+                if attached_main:
+                    short_hooks.append((c.x, c.y))
+                    continue
+                # 5b. 若緊貼在另一顆裝飾音的正上方 (|dx| <= 0.85*sp 且在上方 >= 1.0*sp) -> 單顆倚音上方的斜線小旗標！
+                lower_grace = [
+                    g for g in grace_cands
+                    if g is not c and abs(c.x - g.x) <= sp * 0.85 and (g.y - c.y) >= sp * 1.0
+                ]
+                if lower_grace:
+                    continue
+            filtered_cands.append(c)
+        candidates = filtered_cands
+
+        # 6. 空心符頭（二分音符 / 全音符）偵測
+        closed_roi = cv2.morphologyEx(roi_clean, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
         contours, hierarchy = cv2.findContours(closed_roi, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is not None:
             hier = hierarchy[0]
@@ -737,15 +843,13 @@ class ScoreAnalyzer:
                 if parent_idx < 0:
                     continue
                 hx, hy, hw, hh = cv2.boundingRect(contours[c_idx])
-                ox, oy, ow, oh = cv2.boundingRect(contours[parent_idx])
+                _, _, ow, _ = cv2.boundingRect(contours[parent_idx])
                 hole_area = cv2.contourArea(contours[c_idx])
-                rect_area = max(1.0, float(hw * hh))
-                fill_ratio = hole_area / rect_area
+                fill_ratio = hole_area / max(1.0, float(hw * hh))
                 hcx = hx + hw / 2.0
                 hcy = hy + hh / 2.0
-                if hcx < clef_skip:
+                if hcx < header_skip:
                     continue
-                # 排除圓滑線與五線譜圍出的寬扁大區塊 (ow <= 2.2*sp)，並要求內孔接近橢圓 (fill_ratio >= 0.52)
                 if (
                     (ow <= sp * 2.2)
                     and (sp * 0.32 <= hw <= sp * 1.05)
@@ -756,21 +860,20 @@ class ScoreAnalyzer:
                 ):
                     abs_x = xl + hcx
                     abs_y = ry1 + hcy
-                    # 確認同一個水平位置沒有已被偵測為實心主音符（避免圓滑線與符頭間的小白孔誤判為二分音符）
                     if all(abs(abs_x - c.x) > sp * 0.65 for c in candidates if not c.is_grace):
-                        # 檢查左右側是否有長符幹 (高度 >= 2.0*sp) 以區分二分音符 vs 全音符
-                        sx1 = max(0, int(hcx - sp * 0.9))
-                        sx2 = min(roi.shape[1], int(hcx + sp * 0.9))
-                        sy_top = max(0, int(hcy - sp * 3.2))
-                        sy_bot = min(roi.shape[0], int(hcy + sp * 3.2))
-                        stem_patch = roi[sy_top:sy_bot, sx1:sx2]
-                        has_stem = (stem_patch.shape[0] >= int(sp * 2.2)) and (
-                            int(np.max(np.sum(stem_patch > 0, axis=0))) >= int(sp * 2.0)
+                        sx0 = max(0, int(hcx - sp * 0.9))
+                        sx1 = min(roi.shape[1], int(hcx + sp * 0.9))
+                        sy_t = max(0, int(hcy - sp * 3.2))
+                        sy_b = min(roi.shape[0], int(hcy + sp * 3.2))
+                        stem_patch = pure_stems[sy_t:sy_b, sx0:sx1]
+                        has_stem = (stem_patch.size > 0) and (
+                            int(np.max(np.sum(stem_patch > 0, axis=0))) >= int(sp * 1.4)
                         )
                         candidates.append(
                             _RawNote(
                                 x=abs_x,
                                 y=abs_y,
+                                width=float(ow),
                                 area_ratio=1.1,
                                 is_grace=False,
                                 is_hollow=True,
@@ -780,30 +883,30 @@ class ScoreAnalyzer:
 
         candidates.sort(key=lambda n: n.x)
 
-        # 5. 僅合併真正同一時間點（水平距離 < 0.55*sp）的雙音或雜點
+        # 7. 僅合併真正垂直同軸（水平距離 < 0.50*sp）的雙音和弦
         merged: List[_RawNote] = []
         for cand in candidates:
-            if merged and abs(cand.x - merged[-1].x) < sp * 0.55:
+            if merged and abs(cand.x - merged[-1].x) < sp * 0.50:
                 prev = merged[-1]
-                if prev.is_grace and not cand.is_grace and abs(cand.y - prev.y) > sp * 1.1:
-                    if cand.y > prev.y:
-                        merged[-1] = cand
-                elif not prev.is_grace and cand.is_grace:
-                    pass
-                else:
-                    merged[-1] = _RawNote(
-                        x=(prev.x + cand.x) / 2.0,
-                        y=min(prev.y, cand.y),
-                        area_ratio=max(prev.area_ratio, cand.area_ratio),
-                        is_grace=(prev.is_grace and cand.is_grace),
-                        is_hollow=(prev.is_hollow and cand.is_hollow),
-                        has_stem=(prev.has_stem or cand.has_stem),
-                    )
+                if not prev.is_grace and cand.is_grace:
+                    continue
+                if prev.is_grace and not cand.is_grace:
+                    merged[-1] = cand
+                    continue
+                merged[-1] = _RawNote(
+                    x=(prev.x + cand.x) / 2.0,
+                    y=min(prev.y, cand.y),
+                    width=max(prev.width, cand.width),
+                    area_ratio=max(prev.area_ratio, cand.area_ratio),
+                    is_grace=(prev.is_grace and cand.is_grace),
+                    is_hollow=(prev.is_hollow and cand.is_hollow),
+                    has_stem=(prev.has_stem or cand.has_stem),
+                )
             else:
                 merged.append(cand)
 
-        # 6. 計算每個主音符的符尾橫槓數量（beam_count）與右側附點（is_dotted）
-        num_dots, _, dstats, dcent = cv2.connectedComponentsWithStats(roi_no_beams)
+        # 8. 計算符尾橫槓數量（含長橫槓與 16 分短勾槓）與附點
+        num_dots, _, dstats, dcent = cv2.connectedComponentsWithStats(roi_clean)
         dot_pts = []
         for dlbl in range(1, num_dots):
             dw = int(dstats[dlbl, cv2.CC_STAT_WIDTH])
@@ -823,27 +926,27 @@ class ScoreAnalyzer:
             if not note.is_hollow:
                 beam_ys = []
                 for bar in horiz_bars:
-                    if bar.in_staff_mid and bar.width >= sp * 2.5:
-                        continue
                     if bar.x1 - sp * 0.7 <= note.x <= bar.x2 + sp * 0.7:
                         if abs(bar.y_center - note.y) >= sp * 0.8:
                             beam_ys.append(bar.y_center)
+                for hx, hy in short_hooks:
+                    if abs(hx - note.x) <= sp * 1.25:
+                        beam_ys.append(hy)
                 beam_ys.sort()
                 distinct_beams = 0
                 last_y = None
                 for by in beam_ys:
-                    if last_y is None or abs(by - last_y) >= sp * 0.45:
+                    if last_y is None or abs(by - last_y) >= sp * 0.42:
                         distinct_beams += 1
                         last_y = by
                 note.beam_count = min(3, distinct_beams)
 
-            # 檢查符頭右側 0.65~1.65*sp、上下 0.55*sp 內是否有附點
             note.is_dotted = any(
                 (sp * 0.65 <= (dx - note.x) <= sp * 1.65) and (abs(dy - note.y) <= sp * 0.55)
                 for dx, dy in dot_pts
             )
 
-        return merged, horiz_bars
+        return merged, horiz_bars, header_end_x
 
     @staticmethod
     def _detect_barlines(
@@ -886,7 +989,6 @@ class ScoreAnalyzer:
 
     @staticmethod
     def _y_to_treble_pitch(ny: float, y_bot: float, sp: float) -> Tuple[int, str]:
-        """依據高音譜號五線譜垂直位置推算 MIDI 音高與音名（線距 sp = 2 個自然音階步）"""
         if sp <= 0:
             return 60, "C4"
         step = int(round((y_bot - ny) / (sp / 2.0)))
@@ -904,7 +1006,6 @@ class ScoreAnalyzer:
     def _map_back(
         x: float, y: float, M_inv: Optional[np.ndarray], w: int, h: int
     ) -> Tuple[float, float]:
-        """將校正後影像座標映射回原圖並歸一化至 [0.0, 1.0]"""
         if M_inv is not None:
             ox = float(M_inv[0, 0] * x + M_inv[0, 1] * y + M_inv[0, 2])
             oy = float(M_inv[1, 0] * x + M_inv[1, 1] * y + M_inv[1, 2])

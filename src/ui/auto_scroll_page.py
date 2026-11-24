@@ -310,7 +310,9 @@ class AutoScrollPage(QWidget):
         self._beats_per_measure = 4.0
         self._zoom_factor = 1.0
         self._raw_pixmaps: List[QPixmap] = []
+        self._enhanced_pixmaps: List[QPixmap] = []
         self._raw_rgb_pages: List[np.ndarray] = []
+        self._enhance_view: bool = True
         self._scroll_subpixel = 0.0
 
         # 音符分析、合成器與步進校準狀態
@@ -498,7 +500,14 @@ class AutoScrollPage(QWidget):
 
         row2.addSpacing(8)
 
-        # OMR 視覺校準疊層開關
+        # 去底色強化與 OMR 視覺校準疊層開關
+        self.enhance_view_chk = QCheckBox("✨ 去底色強化")
+        self.enhance_view_chk.setChecked(True)
+        self.enhance_view_chk.setToolTip("自動濾除泛黃底色、陰影與背面透字，強化五線譜與音符黑度")
+        self.enhance_view_chk.setStyleSheet("font-weight: bold; color: #7c3aed;")
+        self.enhance_view_chk.toggled.connect(self._on_enhance_view_toggle)
+        row2.addWidget(self.enhance_view_chk)
+
         self.debug_overlay_chk = QCheckBox("🔬 顯示偵測標記")
         self.debug_overlay_chk.setStyleSheet("font-weight: bold; color: #0f766e;")
         self.debug_overlay_chk.toggled.connect(self._on_debug_overlay_toggle)
@@ -634,6 +643,7 @@ class AutoScrollPage(QWidget):
         try:
             self._stop_playing()
             self._raw_pixmaps.clear()
+            self._enhanced_pixmaps.clear()
             self._raw_rgb_pages.clear()
             self._analysis = None
             self._doc = None
@@ -694,6 +704,7 @@ class AutoScrollPage(QWidget):
             return
 
         self._raw_pixmaps.clear()
+        self._enhanced_pixmaps.clear()
         self._raw_rgb_pages.clear()
         zoom_matrix = fitz.Matrix(150 / 72, 150 / 72)
         for page_idx in range(self._page_count):
@@ -705,6 +716,11 @@ class AutoScrollPage(QWidget):
 
             rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
             self._raw_rgb_pages.append(rgb)
+
+            enh_rgb = np.ascontiguousarray(ScoreAnalyzer.enhance_score_rgb(rgb))
+            eh, ew, _ = enh_rgb.shape
+            enh_qimg = QImage(enh_rgb.data, ew, eh, ew * 3, QImage.Format.Format_RGB888)
+            self._enhanced_pixmaps.append(QPixmap.fromImage(enh_qimg.copy()))
 
     def _run_score_analysis(self):
         if not self._raw_rgb_pages:
@@ -725,8 +741,14 @@ class AutoScrollPage(QWidget):
         if self.placeholder_label:
             self.placeholder_label.hide()
 
+        source_pixmaps = (
+            self._enhanced_pixmaps
+            if (self._enhance_view and len(self._enhanced_pixmaps) == len(self._raw_pixmaps))
+            else self._raw_pixmaps
+        )
+
         scaled_pixmaps = []
-        for pm in self._raw_pixmaps:
+        for pm in source_pixmaps:
             target_w = max(200, int(pm.width() * self._zoom_factor))
             scaled_pm = pm.scaledToWidth(target_w, Qt.TransformationMode.SmoothTransformation)
             scaled_pixmaps.append(scaled_pm)
@@ -819,6 +841,10 @@ class AutoScrollPage(QWidget):
 
     def _on_timbre_change(self, text: str):
         self._synth.timbre = text
+
+    def _on_enhance_view_toggle(self, checked: bool):
+        self._enhance_view = checked
+        self._update_view_scale()
 
     def _on_debug_overlay_toggle(self, checked: bool):
         self._show_debug_overlay = checked
