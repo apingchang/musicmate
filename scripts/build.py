@@ -61,9 +61,11 @@ def main():
         target_file = release_dir / f"MusicMate{exe_ext}"
 
         if built_file.exists():
-            shutil.copy2(built_file, target_file)
+            tmp_target = release_dir / f".MusicMate{exe_ext}.tmp"
+            shutil.copy2(built_file, tmp_target)
             if platform.system() != "Windows":
-                os.chmod(target_file, 0o755)
+                os.chmod(tmp_target, 0o755)
+            os.replace(tmp_target, target_file)
             size_mb = target_file.stat().st_size / (1024 * 1024)
             print("\n" + "=" * 50)
             print("🎉 本地打包成功！")
