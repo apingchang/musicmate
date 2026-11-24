@@ -804,7 +804,12 @@ class AutoScrollPage(QWidget):
             note_y_norm=ev.y_norm,
             is_rest=ev.is_rest,
         )
-        note_tag = f"  ♪ {ev.note_name}" if (not ev.is_rest and ev.note_name) else "  (休止)"
+        if ev.is_rest:
+            note_tag = f"  ({ev.note_name})" if ev.note_name else "  (休止)"
+        elif ev.note_name:
+            note_tag = f"  ♪ {ev.note_name}"
+        else:
+            note_tag = ""
         self.measure_label.setText(f"小節：{ev.measure_number} / {self._analysis.total_measures}{note_tag}")
 
         # 播放中進入新音符時，即時合成並發聲

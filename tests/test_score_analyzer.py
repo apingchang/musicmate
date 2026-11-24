@@ -84,6 +84,31 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
             self.assertGreater(len(pcm), 4000)
             self.assertGreater(int(np.max(np.abs(pcm))), 1000)
 
+    def test_multi_measure_rest_detection(self):
+        """驗證五線譜中央粗橫條 + 上方數字能正確辨識為休止 2 小節"""
+        img = np.full((320, 900, 3), 255, dtype=np.uint8)
+        sp = 12
+        staff_y = 140
+        for i in range(5):
+            cv2.line(img, (60, staff_y + i * sp), (840, staff_y + i * sp), (20, 20, 20), 2)
+        y_top, y_bot = staff_y, staff_y + 4 * sp
+        # 小節線：M1 休止 2 小節 (60..320)，M3 有音符 (320..840)
+        for bx in (320, 840):
+            cv2.line(img, (bx, y_top), (bx, y_bot), (20, 20, 20), 2)
+        # 在第一小節中央繪製粗橫條與上方數字 "2"
+        cv2.rectangle(img, (160, staff_y + 2 * sp - 3), (240, staff_y + 2 * sp + 3), (15, 15, 15), -1)
+        cv2.putText(img, "2", (192, staff_y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (15, 15, 15), 2)
+        # 在第二段小節繪製 2 個實心四分音符
+        for nx in (440, 620):
+            cv2.ellipse(img, (nx, staff_y + 2 * sp), (7, 5), -15, 0, 360, (15, 15, 15), -1)
+
+        res = self.analyzer.analyze_pages([img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        first_ev = res.events[0]
+        self.assertTrue(first_ev.is_rest)
+        self.assertEqual(first_ev.rest_measures, 2)
+        self.assertAlmostEqual(first_ev.duration_beats, 4.0, places=2)
+
     def test_auto_scroll_page_note_tracking_and_click_seek(self):
         rgb = _create_synthetic_score_rgb()
         fd, path = tempfile.mkstemp(suffix=".png")

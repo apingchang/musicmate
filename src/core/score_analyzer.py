@@ -1,11 +1,12 @@
-"""樂譜影像結構分析引擎 (OpenCV OMR Lite)
+"""樂譜影像結構分析引擎 (OpenCV OMR Lite v2)
 
 針對拍照樂譜 (JPG/PNG/WEBP) 與 PDF 樂譜進行純 Python / OpenCV 影像分析：
 1. 自動傾斜偵測與座標校正 (Deskew via HoughLinesP)
 2. 五線譜行 (Staff / System) 精準偵測
 3. 小節線 (Barline) 偵測（自動排除音符符幹誤判）
-4. 音符符頭 (Notehead) 偵測與和弦合併
-5. 依小節與音符水平間距推算節拍時間軸 (Beat Timeline)，供演奏游標即時追蹤
+4. 多小節休止符 (Multi-measure Rest) 偵測（辨識五線譜中央粗橫條與上方小節數字，避免誤判為音符）
+5. 雙尺度符頭偵測：分離主音符與小裝飾音 (Grace Notes)，縮小合併門檻避免相鄰 16 分音符被誤併
+6. 符尾橫槓 (Beam) 計數：區分四分音符 (無槓)、八分音符 (單槓)、十六分音符 (雙槓)，精準計算節拍時值
 """
 
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ import numpy as np
 
 @dataclass
 class NoteEvent:
-    """單一演奏音符或休止事件（座標皆為原圖歸一化 0.0~1.0）"""
+    """單一演奏音符、裝飾音或休止事件（座標皆為原圖歸一化 0.0~1.0）"""
     page_index: int
     staff_index: int
     measure_number: int
@@ -25,6 +26,9 @@ class NoteEvent:
     beat_offset: float
     duration_beats: float
     is_rest: bool = False
+    is_grace: bool = False
+    rest_measures: int = 0
+    beam_count: int = 0
     midi_note: int = 0
     note_name: str = ""
 
@@ -41,6 +45,7 @@ class MeasureInfo:
     y_bot_norm: float
     beat_start: float
     beat_end: float
+    rest_measures: int = 0
     notes: List[NoteEvent] = field(default_factory=list)
 
 
@@ -90,8 +95,27 @@ class ScoreAnalysis:
         return None
 
 
+@dataclass
+class _RawNote:
+    x: float
+    y: float
+    area_ratio: float
+    is_grace: bool
+    beam_count: int = 0
+
+
+@dataclass
+class _HorizBar:
+    x1: float
+    x2: float
+    y_center: float
+    width: float
+    height: float
+    in_staff_mid: bool
+
+
 class ScoreAnalyzer:
-    """純 OpenCV 樂譜結構與音符位置分析器"""
+    """純 OpenCV 樂譜結構、休止符、裝飾音與音符節奏分析器"""
 
     def analyze_pages(
         self,
@@ -150,7 +174,7 @@ class ScoreAnalyzer:
             M_inv = None
             gray_d = gray
 
-        # 2. 自適應二值化（適應手機拍照光線不均與透背雜訊，block_size 足夠大以防實心符頭中空）
+        # 2. 自適應二值化（block_size 足夠大以防實心符頭中空）
         block_size = max(35, int(min(w, h) / 22) | 1)
         block_size = min(block_size, 65)
         binary = cv2.adaptiveThreshold(
@@ -174,20 +198,20 @@ class ScoreAnalyzer:
         cur_measure = start_measure_num
 
         for s_idx, (y_top, y_bot, sp, xl, xr, line_ys) in enumerate(raw_staves):
-            # 4. 偵測該行音符與小節線
-            note_pts = self._detect_noteheads(binary, y_top, y_bot, sp, xl, xr, line_ys)
-            barlines = self._detect_barlines(binary, y_top, y_bot, sp, xl, xr, note_pts)
+            # 4. 偵測該行的橫槓 (Beams / 多小節休止條)、音符符頭 (含裝飾音) 與小節線
+            raw_notes, horiz_bars = self._detect_notes_and_bars(
+                binary, y_top, y_bot, sp, xl, xr, line_ys
+            )
+            main_note_pts = [(n.x, n.y) for n in raw_notes if not n.is_grace]
+            barlines = self._detect_barlines(binary, y_top, y_bot, sp, xl, xr, main_note_pts)
 
             # 決定該行的有效小節切分點
             clef_end = min(xr - sp, xl + sp * 4.2)
-            # 過濾掉太靠左（譜號區內）的小節線
             valid_bars = [bx for bx in barlines if bx > clef_end]
-            # 決定起始 x：若第一個小節線很靠前（如反覆記號），仍保留前面空間作為第一小節（如多小節休止）
             seg_edges = [clef_end] + valid_bars
             if not valid_bars or (xr - seg_edges[-1]) > sp * 3.0:
                 seg_edges.append(float(xr))
 
-            # 移除過窄的假切分（小於 2.2 * sp）
             clean_edges = [seg_edges[0]]
             for ex in seg_edges[1:]:
                 if ex - clean_edges[-1] >= sp * 2.2:
@@ -195,7 +219,6 @@ class ScoreAnalyzer:
             if len(clean_edges) < 2:
                 clean_edges = [clef_end, float(xr)]
 
-            # 轉換五線譜框座標回原圖
             tl_x, tl_y = self._map_back(xl, y_top, M_inv, w, h)
             br_x, br_y = self._map_back(xr, y_bot, M_inv, w, h)
             barlines_norm = [self._map_back(bx, (y_top + y_bot) / 2.0, M_inv, w, h)[0] for bx in valid_bars]
@@ -215,15 +238,72 @@ class ScoreAnalyzer:
             for m_i in range(len(clean_edges) - 1):
                 mx1 = clean_edges[m_i]
                 mx2 = clean_edges[m_i + 1]
+
+                # 檢查是否為多小節休止符：小節內有位於五線譜中央的粗橫條，且沒有主音符
+                m_notes_all = [n for n in raw_notes if mx1 <= n.x <= mx2]
+                m_main_notes = [n for n in m_notes_all if not n.is_grace]
+                mid_rest_bars = [
+                    b for b in horiz_bars
+                    if b.in_staff_mid
+                    and b.width >= sp * 2.8
+                    and b.x1 >= mx1 - sp
+                    and b.x2 <= mx2 + sp
+                ]
+
+                is_multi_rest = (len(mid_rest_bars) > 0 and len(m_main_notes) == 0)
+                if is_multi_rest:
+                    # 檢查休止橫條正上方是否有小節數字（如 "2"），預設多小節休止計為 2 小節
+                    bar = max(mid_rest_bars, key=lambda b: b.width)
+                    has_digit_above = self._has_ink_above_bar(binary, bar, y_top, sp)
+                    rest_count = 2 if has_digit_above else 1
+                elif len(m_notes_all) == 0:
+                    rest_count = 1
+                else:
+                    rest_count = 0
+
                 cur_measure += 1
-
-                # 找出落在此小節內的音符
-                m_notes = [pt for pt in note_pts if mx1 <= pt[0] <= mx2]
-                m_notes.sort(key=lambda p: p[0])
-
                 m_x1_n, m_yt_n = self._map_back(mx1, y_top, M_inv, w, h)
                 m_x2_n, m_yb_n = self._map_back(mx2, y_bot, M_inv, w, h)
 
+                if rest_count > 0:
+                    total_rest_beats = beats_per_measure * rest_count
+                    m_beat_start = cur_beat
+                    m_beat_end = cur_beat + total_rest_beats
+                    measure_info = MeasureInfo(
+                        page_index=page_index,
+                        staff_index=s_idx,
+                        measure_number=cur_measure,
+                        x_start_norm=m_x1_n,
+                        x_end_norm=m_x2_n,
+                        y_top_norm=m_yt_n,
+                        y_bot_norm=m_yb_n,
+                        beat_start=m_beat_start,
+                        beat_end=m_beat_end,
+                        rest_measures=rest_count,
+                    )
+                    cx_n, cy_n = self._map_back((mx1 + mx2) / 2.0, (y_top + y_bot) / 2.0, M_inv, w, h)
+                    ev = NoteEvent(
+                        page_index=page_index,
+                        staff_index=s_idx,
+                        measure_number=cur_measure,
+                        x_norm=cx_n,
+                        y_norm=cy_n,
+                        beat_offset=m_beat_start,
+                        duration_beats=total_rest_beats,
+                        is_rest=True,
+                        rest_measures=rest_count,
+                        note_name=f"休止 {rest_count} 小節",
+                    )
+                    measure_info.notes.append(ev)
+                    page_res.events.append(ev)
+                    # 多小節休止佔用額外小節計數
+                    cur_measure += (rest_count - 1)
+                    cur_beat = m_beat_end
+                    staff_info.measures.append(measure_info)
+                    continue
+
+                # 一般含音符小節：依符尾橫槓數量（beam_count）+ 裝飾音（is_grace）精準推算拍數
+                m_notes_all.sort(key=lambda n: n.x)
                 m_beat_start = cur_beat
                 m_beat_end = cur_beat + beats_per_measure
                 measure_info = MeasureInfo(
@@ -238,51 +318,30 @@ class ScoreAnalyzer:
                     beat_end=m_beat_end,
                 )
 
-                if len(m_notes) == 0:
-                    # 休止小節：在中央放置休止事件
-                    cx_n, cy_n = self._map_back((mx1 + mx2) / 2.0, (y_top + y_bot) / 2.0, M_inv, w, h)
+                durations = self._assign_measure_durations(
+                    m_notes_all, mx2, sp, beats_per_measure
+                )
+                local_beat = m_beat_start
+                for note_obj, dur in zip(m_notes_all, durations):
+                    nx_n, ny_n = self._map_back(note_obj.x, note_obj.y, M_inv, w, h)
+                    midi_val, n_name = self._y_to_treble_pitch(note_obj.y, y_bot, sp)
                     ev = NoteEvent(
                         page_index=page_index,
                         staff_index=s_idx,
                         measure_number=cur_measure,
-                        x_norm=cx_n,
-                        y_norm=cy_n,
-                        beat_offset=m_beat_start,
-                        duration_beats=beats_per_measure,
-                        is_rest=True,
+                        x_norm=nx_n,
+                        y_norm=ny_n,
+                        beat_offset=local_beat,
+                        duration_beats=dur,
+                        is_rest=False,
+                        is_grace=note_obj.is_grace,
+                        beam_count=note_obj.beam_count,
+                        midi_note=midi_val,
+                        note_name=f"({n_name})" if note_obj.is_grace else n_name,
                     )
                     measure_info.notes.append(ev)
                     page_res.events.append(ev)
-                else:
-                    # 依水平視覺間距比例分配小節內的拍數
-                    spans = []
-                    for k, (nx, ny) in enumerate(m_notes):
-                        if k + 1 < len(m_notes):
-                            dx = max(sp * 0.5, m_notes[k + 1][0] - nx)
-                        else:
-                            dx = max(sp * 0.8, mx2 - nx)
-                        spans.append(dx)
-                    total_span = sum(spans)
-                    local_beat = m_beat_start
-                    for k, (nx, ny) in enumerate(m_notes):
-                        dur = beats_per_measure * (spans[k] / total_span) if total_span > 0 else (beats_per_measure / len(m_notes))
-                        nx_n, ny_n = self._map_back(nx, ny, M_inv, w, h)
-                        midi_val, n_name = self._y_to_treble_pitch(ny, y_bot, sp)
-                        ev = NoteEvent(
-                            page_index=page_index,
-                            staff_index=s_idx,
-                            measure_number=cur_measure,
-                            x_norm=nx_n,
-                            y_norm=ny_n,
-                            beat_offset=local_beat,
-                            duration_beats=dur,
-                            is_rest=False,
-                            midi_note=midi_val,
-                            note_name=n_name,
-                        )
-                        measure_info.notes.append(ev)
-                        page_res.events.append(ev)
-                        local_beat += dur
+                    local_beat += dur
 
                 cur_beat = m_beat_end
                 staff_info.measures.append(measure_info)
@@ -290,6 +349,78 @@ class ScoreAnalyzer:
             page_res.staves.append(staff_info)
 
         return page_res, cur_beat, cur_measure
+
+    @staticmethod
+    def _assign_measure_durations(
+        notes: List[_RawNote], mx2: float, sp: float, beats_per_measure: float
+    ) -> List[float]:
+        """結合符尾橫槓數量（beam_count）、裝飾音標記與視覺間距推算每個音符拍數"""
+        n_count = len(notes)
+        if n_count == 0:
+            return []
+
+        # 1. 為裝飾音保留極短時值（約 0.10 拍，總和不超過小節 30%）
+        grace_indices = [i for i, n in enumerate(notes) if n.is_grace]
+        main_indices = [i for i, n in enumerate(notes) if not n.is_grace]
+
+        if not main_indices:
+            # 全部都是小音符時均分
+            return [beats_per_measure / n_count] * n_count
+
+        grace_dur = min(0.10, (beats_per_measure * 0.28) / max(1, len(grace_indices)))
+        total_grace_beats = grace_dur * len(grace_indices)
+        remaining_beats = max(0.25, beats_per_measure - total_grace_beats)
+
+        # 2. 為主音符依「符尾橫槓數 (beam_count)」與「水平間距」計算相對時值權重
+        main_weights = []
+        for idx_pos, idx in enumerate(main_indices):
+            note = notes[idx]
+            # 依橫槓數給予樂理基準權重：雙槓=16分(0.25)、單槓=8分(0.50)、無槓=4分(1.0)
+            if note.beam_count >= 2:
+                beam_w = 0.25
+            elif note.beam_count == 1:
+                beam_w = 0.50
+            else:
+                beam_w = 1.00
+
+            # 輔助計算到下一個主音符（或小節線）的水平距離，處理附點音符或二分音符
+            if idx_pos + 1 < len(main_indices):
+                next_x = notes[main_indices[idx_pos + 1]].x
+            else:
+                next_x = mx2
+            dx = max(sp * 0.8, next_x - note.x)
+            main_weights.append((beam_w, dx))
+
+        # 混合 75% 橫槓樂理權重 + 25% 水平間距權重（保留附點/長音拉長感，同時讓 16 分音符明確輕快）
+        avg_dx = sum(d for _, d in main_weights) / len(main_weights)
+        combined = []
+        for bw, dx in main_weights:
+            dx_norm = (dx / avg_dx) if avg_dx > 0 else 1.0
+            # 限制間距影響範圍避免過大
+            dx_factor = max(0.5, min(2.0, dx_norm))
+            combined.append(bw * (0.75 + 0.25 * dx_factor))
+
+        total_w = sum(combined)
+        durations = [0.0] * n_count
+        for i in grace_indices:
+            durations[i] = grace_dur
+        for idx, w_val in zip(main_indices, combined):
+            durations[idx] = remaining_beats * (w_val / total_w) if total_w > 0 else (remaining_beats / len(main_indices))
+
+        return durations
+
+    @staticmethod
+    def _has_ink_above_bar(binary: np.ndarray, bar: _HorizBar, y_top: float, sp: float) -> bool:
+        """檢查多小節休止橫條正上方（五線譜上方 0.2~3.0 sp）是否有休止小節數字"""
+        h, w = binary.shape[:2]
+        ry1 = max(0, int(y_top - sp * 3.0))
+        ry2 = max(ry1 + 1, int(y_top - sp * 0.15))
+        rx1 = max(0, int(bar.x1))
+        rx2 = min(w, int(bar.x2))
+        if rx2 <= rx1 or ry2 <= ry1:
+            return False
+        ink = int(np.sum(binary[ry1:ry2, rx1:rx2] > 0))
+        return ink >= int(sp * sp * 0.35)
 
     @staticmethod
     def _estimate_skew(gray: np.ndarray) -> float:
@@ -361,7 +492,7 @@ class ScoreAnalyzer:
         return staves
 
     @staticmethod
-    def _detect_noteheads(
+    def _detect_notes_and_bars(
         binary: np.ndarray,
         y_top: float,
         y_bot: float,
@@ -369,17 +500,17 @@ class ScoreAnalyzer:
         xl: int,
         xr: int,
         line_ys: List[float],
-    ) -> List[Tuple[float, float]]:
-        """去除五線譜線後偵測音符符頭中心座標 (x, y)"""
+    ) -> Tuple[List[_RawNote], List[_HorizBar]]:
+        """去除五線譜線後，同時偵測橫槓 (Beams / 多小節休止條) 與雙尺度音符符頭（主音符 + 裝飾音）"""
         h, w = binary.shape[:2]
-        pad = int(sp * 3.0)
+        pad = int(sp * 3.5)
         ry1 = max(0, int(y_top - pad))
         ry2 = min(h, int(y_bot + pad))
         roi = binary[ry1:ry2, xl:xr].copy()
-        sy1 = int(y_top - ry1)
-        sy2 = int(y_bot - ry1)
+        sy1 = float(y_top - ry1)
+        sy2 = float(y_bot - ry1)
 
-        # 移除純五線譜橫線（保留上下交會之音符筆畫）
+        # 1. 移除純五線譜橫線（保留上下交會之音符與符幹筆畫）
         for ly in line_ys:
             ly_rel = int(round(ly - ry1))
             for dy in (-1, 0, 1):
@@ -388,14 +519,40 @@ class ScoreAnalyzer:
                     pure = (roi[r - 2, :] == 0) & (roi[r + 2, :] == 0)
                     roi[r, pure] = 0
 
-        # 以橢圓核心型態學開運算提取實心符頭
-        nh_h = max(3, int(round(sp * 0.62)))
-        nh_w = max(3, int(round(sp * 0.72)))
+        # 2. 提取粗橫槓（符尾連槓 Beams 與多小節休止橫條）：寬 >= 1.65*sp，高 >= 0.26*sp
+        beam_w = max(8, int(round(sp * 1.65)))
+        beam_h = max(2, int(round(sp * 0.26)))
+        beam_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (beam_w, beam_h))
+        beams_mask = cv2.morphologyEx(roi, cv2.MORPH_OPEN, beam_kernel)
+
+        num_b, _, bstats, bcent = cv2.connectedComponentsWithStats(beams_mask)
+        horiz_bars: List[_HorizBar] = []
+        for lbl in range(1, num_b):
+            bx = int(bstats[lbl, cv2.CC_STAT_LEFT])
+            bw = int(bstats[lbl, cv2.CC_STAT_WIDTH])
+            bh = int(bstats[lbl, cv2.CC_STAT_HEIGHT])
+            cy = float(bcent[lbl][1])
+            in_mid = (sy1 + sp * 1.15) <= cy <= (sy2 - sp * 1.15)
+            horiz_bars.append(
+                _HorizBar(
+                    x1=float(xl + bx),
+                    x2=float(xl + bx + bw),
+                    y_center=float(ry1 + cy),
+                    width=float(bw),
+                    height=float(bh),
+                    in_staff_mid=in_mid,
+                )
+            )
+
+        # 3. 扣除粗橫槓後，以雙尺度橢圓核心偵測符頭（涵蓋一般實心符頭與較小的 16 分/裝飾音符頭）
+        roi_no_beams = cv2.subtract(roi, cv2.dilate(beams_mask, np.ones((3, 3), np.uint8)))
+        nh_w = max(3, int(round(sp * 0.50)))
+        nh_h = max(3, int(round(sp * 0.45)))
         nh_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (nh_w, nh_h))
-        nh_mask = cv2.morphologyEx(roi, cv2.MORPH_OPEN, nh_kernel)
+        nh_mask = cv2.morphologyEx(roi_no_beams, cv2.MORPH_OPEN, nh_kernel)
 
         num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(nh_mask)
-        raw_notes: List[Tuple[float, float]] = []
+        candidates: List[_RawNote] = []
         clef_skip = int(sp * 4.2)
 
         for lbl in range(1, num_labels):
@@ -406,26 +563,73 @@ class ScoreAnalyzer:
             if cx < clef_skip:
                 continue
             aspect = cw / max(1.0, float(ch))
+            area_ratio = area / max(1.0, sp * sp)
             if (
-                (sp * 0.50 <= ch <= sp * 1.65)
-                and (sp * 0.55 <= cw <= sp * 1.90)
-                and (0.55 <= aspect <= 2.10)
-                and (area >= sp * sp * 0.30)
+                (sp * 0.36 <= ch <= sp * 1.60)
+                and (sp * 0.40 <= cw <= sp * 1.85)
+                and (0.50 <= aspect <= 2.15)
+                and (area_ratio >= 0.18)
                 and ((sy1 - sp * 2.5) <= cy <= (sy2 + sp * 2.5))
             ):
-                raw_notes.append((xl + cx, ry1 + cy))
+                is_grace = area_ratio < 0.72
+                candidates.append(
+                    _RawNote(
+                        x=xl + cx,
+                        y=ry1 + cy,
+                        area_ratio=area_ratio,
+                        is_grace=is_grace,
+                    )
+                )
 
-        raw_notes.sort(key=lambda p: p[0])
+        candidates.sort(key=lambda n: n.x)
 
-        # 合併同時間點的和弦音符或重疊偵測（水平距離 < 0.95 * sp）
-        merged: List[Tuple[float, float]] = []
-        for nx, ny in raw_notes:
-            if merged and abs(nx - merged[-1][0]) < sp * 0.95:
-                px, py = merged[-1]
-                merged[-1] = ((px + nx) / 2.0, min(py, ny))
+        # 4. 僅合併真正垂直堆疊（同一時間點）的雙音/和弦或裝飾音上方小符槓（水平距離 < 0.55 * sp）
+        #    避免將相鄰的 16 分音符或裝飾音誤併成單一音符！
+        merged: List[_RawNote] = []
+        for cand in candidates:
+            if merged and abs(cand.x - merged[-1].x) < sp * 0.55:
+                prev = merged[-1]
+                # 若一個是裝飾音符頭、另一個是上方小連槓，保留較靠五線譜內側的符頭
+                if prev.is_grace and not cand.is_grace and abs(cand.y - prev.y) > sp * 1.1:
+                    # 保留原本的裝飾音符頭（cand 可能是上方小粗塊），若 cand 明顯較低且在譜內則保留主音符
+                    if cand.y > prev.y:
+                        merged[-1] = cand
+                elif not prev.is_grace and cand.is_grace:
+                    # 主音符優先，忽略緊貼在同 x 的小雜點/裝飾符槓
+                    pass
+                else:
+                    # 同質雙音和弦：取平均 x，保留較高音或較大面積
+                    merged[-1] = _RawNote(
+                        x=(prev.x + cand.x) / 2.0,
+                        y=min(prev.y, cand.y),
+                        area_ratio=max(prev.area_ratio, cand.area_ratio),
+                        is_grace=(prev.is_grace and cand.is_grace),
+                    )
             else:
-                merged.append((nx, ny))
-        return merged
+                merged.append(cand)
+
+        # 5. 為每個主音符計算其所屬的符尾橫槓數量（beam_count: 0=四分, 1=八分, 2+=十六分）
+        for note in merged:
+            if note.is_grace:
+                note.beam_count = 2
+                continue
+            beam_ys = []
+            for bar in horiz_bars:
+                # 排除多小節休止長條，只看音符水平範圍內的符尾橫槓（位於符頭上方或下方）
+                if bar.x1 - sp * 0.7 <= note.x <= bar.x2 + sp * 0.7:
+                    if abs(bar.y_center - note.y) >= sp * 0.8:
+                        beam_ys.append(bar.y_center)
+            # 計算不同 y 層級的橫槓數量（同 y 差異 < 0.45*sp 視為同一條）
+            beam_ys.sort()
+            distinct_beams = 0
+            last_y = None
+            for by in beam_ys:
+                if last_y is None or abs(by - last_y) >= sp * 0.45:
+                    distinct_beams += 1
+                    last_y = by
+            note.beam_count = min(3, distinct_beams)
+
+        return merged, horiz_bars
 
     @staticmethod
     def _detect_barlines(
@@ -471,10 +675,9 @@ class ScoreAnalyzer:
         """依據高音譜號五線譜垂直位置推算 MIDI 音高與音名（線距 sp = 2 個自然音階步）"""
         if sp <= 0:
             return 60, "C4"
-        # 底線 y_bot = E4（step = 0），每往上 0.5 * sp 為 1 個自然音階步
         step = int(round((y_bot - ny) / (sp / 2.0)))
         step = max(-14, min(20, step))
-        diatonic_idx = 2 + step  # C=0, D=1, E=2, F=3, G=4, A=5, B=6
+        diatonic_idx = 2 + step
         octave = 4 + (diatonic_idx // 7)
         deg = diatonic_idx % 7
         semitones = (0, 2, 4, 5, 7, 9, 11)
