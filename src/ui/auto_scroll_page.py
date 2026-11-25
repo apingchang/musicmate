@@ -19,7 +19,7 @@ from PyQt6.QtGui import (
 )
 
 from src.core.score_analyzer import (
-    ScoreAnalyzer, ScoreAnalysis, PageAnalysis, StaffInfo, NoteEvent
+    ScoreAnalyzer, ScoreAnalysis, PageAnalysis, StaffInfo, NoteEvent, PlaybackMeasure
 )
 from src.core.note_synth import NoteSynthesizer
 
@@ -43,6 +43,7 @@ class ScorePageWidget(QWidget):
         self._note_y_norm: Optional[float] = None
         self._is_rest: bool = False
         self._is_grace: bool = False
+        self._repeat_pass: int = 1
 
         # OMR 視覺校準標記狀態
         self._page_analysis: Optional[PageAnalysis] = None
@@ -71,6 +72,7 @@ class ScorePageWidget(QWidget):
         note_y_norm: Optional[float] = None,
         is_rest: bool = False,
         is_grace: bool = False,
+        repeat_pass: int = 1,
     ):
         """更新本頁的演奏游標位置；若 staff 為 None 則清除本頁游標"""
         self._active_staff = staff
@@ -79,6 +81,7 @@ class ScorePageWidget(QWidget):
         self._note_y_norm = note_y_norm
         self._is_rest = is_rest
         self._is_grace = is_grace
+        self._repeat_pass = repeat_pass
         self.update()
 
     def clear_playhead(self):
@@ -186,6 +189,19 @@ class ScorePageWidget(QWidget):
         painter.setBrush(QBrush(QColor(231, 45, 45, 235)))
         painter.drawPolygon(triangle)
 
+        # 若目前處於反覆記號「第 2 遍」，於紅標旁顯示醒目紫紅徽章
+        if self._repeat_pass >= 2:
+            badge_font = QFont("Sans Serif", 8)
+            badge_font.setBold(True)
+            painter.setFont(badge_font)
+            bx_badge = min(w - 54.0, cx + tri_half_w + 3.0)
+            by_badge = max(2.0, tri_top_y - 2.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(190, 24, 93, 225)))
+            painter.drawRoundedRect(QRectF(bx_badge, by_badge, 48.0, 15.0), 4.0, 4.0)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(QRectF(bx_badge, by_badge, 48.0, 15.0), Qt.AlignmentFlag.AlignCenter, f"第{self._repeat_pass}遍")
+
         # 3d. 目前播放音符柔和光圈（區分一般主音符與紫色小裝飾音）
         if not self._is_rest and self._note_x_norm is not None and self._note_y_norm is not None:
             nx = self._note_x_norm * w
@@ -232,13 +248,27 @@ class ScorePageWidget(QWidget):
                 mx2 = m.x_end_norm * w
                 m_yt1, m_yb1 = st.y_range_at(m.x_start_norm)
                 yt1_px, yb1_px = m_yt1 * h, m_yb1 * h
-                # 小節起點藍色虛線與小節號 M#
-                painter.setPen(QPen(QColor(37, 99, 235, 175), 1.2, Qt.PenStyle.DashLine))
-                painter.drawLine(QPointF(mx1, yt1_px - sp_px * 1.2), QPointF(mx1, yb1_px + sp_px * 0.8))
+                # 小節起點線與小節號 M#（若為前反覆記號 ||: 則以醒目洋紅雙線標示）
+                if m.repeat_start:
+                    painter.setPen(QPen(QColor(190, 24, 93, 235), 2.2))
+                    painter.drawLine(QPointF(mx1, yt1_px - sp_px * 1.2), QPointF(mx1, yb1_px + sp_px * 0.8))
+                else:
+                    painter.setPen(QPen(QColor(37, 99, 235, 175), 1.2, Qt.PenStyle.DashLine))
+                    painter.drawLine(QPointF(mx1, yt1_px - sp_px * 1.2), QPointF(mx1, yb1_px + sp_px * 0.8))
 
-                m_title = f"M{m.measure_number}" if m.rest_measures <= 1 else f"M{m.measure_number}..{m.measure_number + m.rest_measures - 1}"
-                painter.setPen(QColor(29, 78, 216, 225))
+                base_m_title = f"M{m.measure_number}" if m.rest_measures <= 1 else f"M{m.measure_number}..{m.measure_number + m.rest_measures - 1}"
+                m_title = f"||: {base_m_title}" if m.repeat_start else base_m_title
+                painter.setPen(QColor(190, 24, 93, 245) if m.repeat_start else QColor(29, 78, 216, 225))
                 painter.drawText(QPointF(mx1 + 3.0, yt1_px - sp_px * 1.3), m_title)
+
+                # 若此小節結尾具後反覆記號 :||，於小節右界繪製醒目洋紅 :|| 標記
+                if m.repeat_end:
+                    m_yt2_r, m_yb2_r = st.y_range_at(m.x_end_norm)
+                    yt2_px, yb2_px = m_yt2_r * h, m_yb2_r * h
+                    painter.setPen(QPen(QColor(190, 24, 93, 235), 2.2))
+                    painter.drawLine(QPointF(mx2, yt2_px - sp_px * 1.2), QPointF(mx2, yb2_px + sp_px * 0.8))
+                    painter.setPen(QColor(190, 24, 93, 245))
+                    painter.drawText(QPointF(max(4.0, mx2 - 22.0), yt2_px - sp_px * 1.3), ":||")
 
                 # 若為休止小節，沿五線譜傾角畫淡橘色區塊標示
                 if m.rest_measures > 0:
@@ -323,10 +353,11 @@ class ScoreViewWidget(QWidget):
         note_y_norm: Optional[float] = None,
         is_rest: bool = False,
         is_grace: bool = False,
+        repeat_pass: int = 1,
     ):
         for i, page_w in enumerate(self.page_labels):
             if i == page_index and staff is not None and cursor_x_norm is not None:
-                page_w.set_playhead(staff, cursor_x_norm, note_x_norm, note_y_norm, is_rest, is_grace)
+                page_w.set_playhead(staff, cursor_x_norm, note_x_norm, note_y_norm, is_rest, is_grace, repeat_pass)
             else:
                 page_w.clear_playhead()
 
@@ -372,6 +403,7 @@ class AutoScrollPage(QWidget):
         self._last_scrolled_staff: Tuple[int, int] = (-1, -1)
         self._last_played_event_idx: int = -1
         self._show_debug_overlay: bool = False
+        self._enable_repeats: bool = True
 
         # 滾動 / 游標定時器（約 30 FPS）
         self._scroll_timer = QTimer(self)
@@ -546,7 +578,14 @@ class AutoScrollPage(QWidget):
 
         row2.addSpacing(8)
 
-        # 去底色強化與 OMR 視覺校準疊層開關
+        # 反覆記號開關、去底色強化與 OMR 視覺校準疊層開關
+        self.repeat_chk = QCheckBox("🔁 啟用反覆")
+        self.repeat_chk.setChecked(True)
+        self.repeat_chk.setToolTip("遇到後反覆記號 :|| 時自動跳回前反覆記號 ||:（或樂曲開頭）重播第 2 遍")
+        self.repeat_chk.setStyleSheet("font-weight: bold; color: #be185d;")
+        self.repeat_chk.toggled.connect(self._on_repeat_toggle)
+        row2.addWidget(self.repeat_chk)
+
         self.enhance_view_chk = QCheckBox("✨ 去底色強化")
         self.enhance_view_chk.setChecked(True)
         self.enhance_view_chk.setToolTip("自動濾除泛黃底色、陰影與背面透字，強化五線譜與音符黑度")
@@ -726,9 +765,13 @@ class AutoScrollPage(QWidget):
             if self._analysis and self._analysis.has_staves:
                 n_staves = sum(len(p.staves) for p in self._analysis.pages)
                 n_events = len(self._analysis.events)
+                rep_info = ""
+                if self._analysis.repeat_sections:
+                    sec_str = ", ".join(f"M{s}~M{e}" for s, e in self._analysis.repeat_sections)
+                    rep_info = f"、反覆區段 ||: {sec_str} :||"
                 self.status_text.setText(
                     f"已載入：{file_name}（{self._page_count} 頁 | 偵測到 {n_staves} 行五線譜、"
-                    f"共 {self._analysis.total_measures} 小節、{n_events} 個演奏事件）"
+                    f"共 {self._analysis.total_measures} 小節{rep_info}、{n_events} 個演奏事件）"
                 )
                 self._sync_playhead_visual(scroll_to_staff=False)
             else:
@@ -776,6 +819,7 @@ class AutoScrollPage(QWidget):
             self._analysis = self._analyzer.analyze_pages(
                 self._raw_rgb_pages,
                 beats_per_measure=self._beats_per_measure,
+                enable_repeats=self._enable_repeats,
             )
         except Exception:
             self._analysis = None
@@ -888,6 +932,24 @@ class AutoScrollPage(QWidget):
     def _on_timbre_change(self, text: str):
         self._synth.timbre = text
 
+    def _on_repeat_toggle(self, checked: bool):
+        self._enable_repeats = checked
+        if self._analysis and self._analysis.has_staves:
+            was_playing = self._is_playing
+            self._stop_playing()
+            self._analyzer.rebuild_timeline(
+                self._analysis,
+                beats_per_measure=self._beats_per_measure,
+                enable_repeats=self._enable_repeats,
+            )
+            self._current_beat = min(self._current_beat, max(0.0, self._analysis.total_beats - 1e-4))
+            self._last_scrolled_staff = (-1, -1)
+            self._sync_playhead_visual(scroll_to_staff=False)
+            state_str = "已啟用反覆記號重播" if checked else "已關閉反覆記號（直通單遍播放）"
+            self.status_text.setText(f"{state_str}（總演奏事件：{len(self._analysis.events)} 個）。")
+            if was_playing:
+                self._start_playing()
+
     def _on_enhance_view_toggle(self, checked: bool):
         self._enhance_view = checked
         self._update_view_scale()
@@ -904,74 +966,82 @@ class AutoScrollPage(QWidget):
         if self._use_note_tracking():
             self._sync_playhead_visual(scroll_to_staff=True)
 
-    # === 逐小節播放與跳轉控制 ===
-    def _get_all_measures(self):
+    # === 逐小節播放與跳轉控制（完整支援反覆記號第 1 遍與第 2 遍序列）===
+    def _get_playback_measures(self) -> List[PlaybackMeasure]:
         if not self._analysis:
             return []
-        measures = []
+        if self._analysis.playback_measures:
+            return self._analysis.playback_measures
+        # 相容備援
+        res: List[PlaybackMeasure] = []
         for p in self._analysis.pages:
             for s in p.staves:
-                measures.extend(s.measures)
-        return measures
+                for m in s.measures:
+                    res.append(PlaybackMeasure(measure=m, beat_start=m.beat_start, beat_end=m.beat_end))
+        return res
 
-    def _find_current_measure_idx(self, measures) -> int:
-        if not measures:
+    def _find_current_measure_idx(self, p_measures: List[PlaybackMeasure]) -> int:
+        if not p_measures:
             return -1
-        _, ev = self._find_event_at_beat(self._current_beat)
-        for i, m in enumerate(measures):
-            if m.measure_number == ev.measure_number:
+        for i, pm in enumerate(p_measures):
+            if pm.beat_start - 1e-5 <= self._current_beat < pm.beat_end - 1e-5:
                 return i
+        if self._current_beat >= p_measures[-1].beat_end - 1e-5:
+            return len(p_measures) - 1
         return 0
 
     def _on_prev_measure(self):
-        """跳至上一小節開頭並試聽第一音"""
+        """跳至上一播放小節開頭並試聽第一音"""
         if not self._use_note_tracking():
             return
         self._stop_playing()
-        measures = self._get_all_measures()
-        if not measures:
+        p_measures = self._get_playback_measures()
+        if not p_measures:
             return
-        cur_m_idx = self._find_current_measure_idx(measures)
+        cur_m_idx = self._find_current_measure_idx(p_measures)
         target_idx = max(0, cur_m_idx - 1)
-        self._jump_to_measure_obj(measures[target_idx], preview_sound=True)
+        self._jump_to_playback_measure(p_measures[target_idx], preview_sound=True)
 
     def _on_next_measure(self):
-        """跳至下一小節開頭並試聽第一音"""
+        """跳至下一播放小節開頭（含反覆跳回第 2 遍）並試聽第一音"""
         if not self._use_note_tracking():
             return
         self._stop_playing()
-        measures = self._get_all_measures()
-        if not measures:
+        p_measures = self._get_playback_measures()
+        if not p_measures:
             return
-        cur_m_idx = self._find_current_measure_idx(measures)
-        target_idx = min(len(measures) - 1, cur_m_idx + 1)
-        self._jump_to_measure_obj(measures[target_idx], preview_sound=True)
+        cur_m_idx = self._find_current_measure_idx(p_measures)
+        target_idx = min(len(p_measures) - 1, cur_m_idx + 1)
+        self._jump_to_playback_measure(p_measures[target_idx], preview_sound=True)
 
     def _on_play_current_measure(self):
         """從當前小節第一拍完整播放完本小節後自動暫停"""
         if not self._use_note_tracking():
             return
-        measures = self._get_all_measures()
-        if not measures:
+        p_measures = self._get_playback_measures()
+        if not p_measures:
             return
-        cur_m_idx = self._find_current_measure_idx(measures)
-        m = measures[cur_m_idx]
+        cur_m_idx = self._find_current_measure_idx(p_measures)
+        pm = p_measures[cur_m_idx]
+        m = pm.measure
         self._stop_playing()
-        self._current_beat = m.beat_start
-        self._stop_at_beat = m.beat_end
-        self.status_text.setText(f"正在單獨播放第 {m.measure_number} 小節（播畢自動暫停）...")
+        self._current_beat = pm.beat_start
+        self._stop_at_beat = pm.beat_end
+        pass_tag = f"（🔁 第 {pm.repeat_pass} 遍）" if pm.repeat_pass >= 2 else ""
+        self.status_text.setText(f"正在單獨播放第 {m.measure_number} 小節{pass_tag}（播畢自動暫停）...")
         self._start_playing()
-        # _start_playing 不清除剛設定的 _stop_at_beat
-        self._stop_at_beat = m.beat_end
+        self._stop_at_beat = pm.beat_end
 
-    def _jump_to_measure_obj(self, m, preview_sound: bool = True):
-        self._current_beat = m.beat_start
+    def _jump_to_playback_measure(self, pm: PlaybackMeasure, preview_sound: bool = True):
+        m = pm.measure
+        self._current_beat = pm.beat_start + 1e-4
         self._sync_playhead_visual(scroll_to_staff=True)
         if preview_sound and m.notes:
             first_ev = m.notes[0]
             if not first_ev.is_rest and first_ev.midi_note > 0:
                 self._synth.play_note(first_ev.midi_note, duration_sec=0.30)
-        self.status_text.setText(f"已跳至第 {m.measure_number} 小節（共 {len(m.notes)} 個事件）。")
+        pass_tag = f" [🔁 反覆第 {pm.repeat_pass} 遍]" if pm.repeat_pass >= 2 else ""
+        self.status_text.setText(f"已跳至第 {m.measure_number} 小節{pass_tag}（共 {len(m.notes)} 個事件）。")
 
     # === 逐音符步進與單音校準試聽 ===
     def _on_prev_note(self):
@@ -1025,11 +1095,14 @@ class AutoScrollPage(QWidget):
         beats = self.TIME_SIGNATURES.get(text, 4.0)
         if beats != self._beats_per_measure:
             self._beats_per_measure = beats
-            if self._raw_rgb_pages:
+            if self._analysis and self._analysis.has_staves:
                 was_playing = self._is_playing
                 self._stop_playing()
-                self._run_score_analysis()
-                self._update_view_scale()
+                self._analyzer.rebuild_timeline(
+                    self._analysis,
+                    beats_per_measure=self._beats_per_measure,
+                    enable_repeats=self._enable_repeats,
+                )
                 self._current_beat = 0.0
                 self._last_scrolled_staff = (-1, -1)
                 if self._use_note_tracking():
@@ -1147,7 +1220,13 @@ class AutoScrollPage(QWidget):
             next_x = staff.x_right_norm
             if idx + 1 < len(self._analysis.events):
                 nxt = self._analysis.events[idx + 1]
-                if nxt.page_index == ev.page_index and nxt.staff_index == ev.staff_index:
+                # 若下一音在同一行且在當前音右側，平滑插值至下一音；若遇到 :|| 反覆回跳左側或換行，則先推進至本小節右界
+                if (
+                    nxt.page_index == ev.page_index
+                    and nxt.staff_index == ev.staff_index
+                    and nxt.x_norm >= ev.x_norm - 1e-4
+                    and nxt.repeat_pass == ev.repeat_pass
+                ):
                     next_x = nxt.x_norm
                 else:
                     for m in staff.measures:
@@ -1164,7 +1243,22 @@ class AutoScrollPage(QWidget):
             note_y_norm=ev.y_norm,
             is_rest=ev.is_rest,
             is_grace=ev.is_grace,
+            repeat_pass=ev.repeat_pass,
         )
+
+        # 組裝反覆記號狀態標籤
+        pass_badge = f" [🔁第{ev.repeat_pass}遍]" if ev.repeat_pass >= 2 else ""
+        rep_notes = []
+        if ev.repeat_start:
+            rep_notes.append("||: 反覆起點")
+        if ev.repeat_end:
+            if ev.repeat_jump_to > 0:
+                rep_notes.append(f":|| 播畢回跳 M{ev.repeat_jump_to}")
+            else:
+                rep_notes.append(":|| 反覆終點")
+        rep_detail = f"  |  反覆：{' • '.join(rep_notes)}" if rep_notes else ""
+        if ev.repeat_pass >= 2:
+            rep_detail += f" (目前第 {ev.repeat_pass} 遍)"
 
         # 更新左上徽章與音符校準詳細資訊列
         if ev.is_rest:
@@ -1172,16 +1266,17 @@ class AutoScrollPage(QWidget):
                 f"{ev.measure_number}~{ev.measure_number + ev.rest_measures - 1}"
                 if ev.rest_measures > 1 else f"{ev.measure_number}"
             )
-            self.measure_label.setText(f"小節：{m_range} / {self._analysis.total_measures}  ({ev.note_type})")
+            self.measure_label.setText(f"小節：{m_range} / {self._analysis.total_measures}{pass_badge}  ({ev.note_type})")
             self.note_detail_label.setText(
                 f"🔎 事件 #{ev.event_index}/{len(self._analysis.events)}  |  "
                 f"第 {ev.staff_index + 1} 行 • 第 {m_range} 小節 (第 1/1 個事件)  |  "
                 f"類型：【{ev.note_type}】  |  音高：靜音 (Rest)  |  "
-                f"時值：{ev.duration_beats:.2f} 拍 (起始 {ev.beat_offset:.2f} 拍)"
+                f"時值：{ev.duration_beats:.2f} 拍 (起始 {ev.beat_offset:.2f} 拍){rep_detail}"
             )
         else:
+            rep_sym = "||: " if (ev.repeat_start and ev.note_index_in_measure == 1) else ""
             self.measure_label.setText(
-                f"小節：{ev.measure_number} / {self._analysis.total_measures}  ♪ {ev.note_name}"
+                f"小節：{rep_sym}{ev.measure_number} / {self._analysis.total_measures}{pass_badge}  ♪ {ev.note_name}"
             )
             self.note_detail_label.setText(
                 f"🔎 事件 #{ev.event_index}/{len(self._analysis.events)}  |  "
@@ -1189,7 +1284,7 @@ class AutoScrollPage(QWidget):
                 f"第 {ev.note_index_in_measure}/{ev.notes_in_measure} 個音符  |  "
                 f"類型：【{ev.note_type}】  |  "
                 f"音高：{ev.note_name} (MIDI {ev.midi_note} • {ev.freq_hz:.1f} Hz)  |  "
-                f"時長：{ev.duration_beats:.2f} 拍 (橫槓={ev.beam_count})"
+                f"時長：{ev.duration_beats:.2f} 拍 (橫槓={ev.beam_count}){rep_detail}"
             )
 
         # 連續播放中進入新音符時發聲

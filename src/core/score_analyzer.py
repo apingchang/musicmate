@@ -10,6 +10,7 @@
 6. 反覆記號雙點 (|: / :|) 過濾與多小節休止符 (H-bar + 數字 2..8) 精準辨識
 """
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -39,6 +40,10 @@ class NoteEvent:
     midi_note: int = 0
     note_name: str = ""
     note_type: str = ""
+    repeat_pass: int = 1
+    repeat_start: bool = False
+    repeat_end: bool = False
+    repeat_jump_to: int = 0
 
     @property
     def freq_hz(self) -> float:
@@ -49,7 +54,7 @@ class NoteEvent:
 
 @dataclass
 class MeasureInfo:
-    """單一小節資訊"""
+    """單一小節資訊（對應譜面實體小節，含前/後反覆記號屬性）"""
     page_index: int
     staff_index: int
     measure_number: int
@@ -60,7 +65,19 @@ class MeasureInfo:
     beat_start: float
     beat_end: float
     rest_measures: int = 0
+    repeat_start: bool = False
+    repeat_end: bool = False
     notes: List[NoteEvent] = field(default_factory=list)
+
+
+@dataclass
+class PlaybackMeasure:
+    """實際播放順序中的單遍小節（支援第 1 遍與反覆第 2 遍精準跳轉與單小節播放）"""
+    measure: MeasureInfo
+    beat_start: float
+    beat_end: float
+    repeat_pass: int = 1
+    jump_to_measure: int = 0
 
 
 @dataclass
@@ -100,12 +117,15 @@ class PageAnalysis:
 
 @dataclass
 class ScoreAnalysis:
-    """整份樂譜的分析結果與總演奏時間軸"""
+    """整份樂譜的分析結果與總演奏時間軸（含反覆記號展開序列）"""
     pages: List[PageAnalysis] = field(default_factory=list)
     events: List[NoteEvent] = field(default_factory=list)
+    playback_measures: List[PlaybackMeasure] = field(default_factory=list)
+    repeat_sections: List[Tuple[int, int]] = field(default_factory=list)
     total_beats: float = 0.0
     total_measures: int = 0
     beats_per_measure: float = 4.0
+    enable_repeats: bool = True
 
     @property
     def has_staves(self) -> bool:
@@ -117,6 +137,22 @@ class ScoreAnalysis:
             if 0 <= staff_index < len(staves):
                 return staves[staff_index]
         return None
+
+
+@dataclass
+class _BarlineInfo:
+    x_center: float
+    x_left: float
+    x_right: float
+    repeat_end_left: bool = False
+    repeat_start_right: bool = False
+
+
+@dataclass
+class _EdgeMark:
+    x: float
+    repeat_end_left: bool = False
+    repeat_start_right: bool = False
 
 
 @dataclass
@@ -140,6 +176,7 @@ class _HorizBar:
     width: float
     height: float
     in_staff_mid: bool
+    n_stems: int = 0
 
 
 class ScoreAnalyzer:
@@ -177,8 +214,12 @@ class ScoreAnalyzer:
         self,
         rgb_images: List[np.ndarray],
         beats_per_measure: float = 4.0,
+        enable_repeats: bool = True,
     ) -> ScoreAnalysis:
-        analysis = ScoreAnalysis(beats_per_measure=beats_per_measure)
+        analysis = ScoreAnalysis(
+            beats_per_measure=beats_per_measure,
+            enable_repeats=enable_repeats,
+        )
         cumulative_beat = 0.0
         measure_counter = 0
         event_counter = 0
@@ -193,11 +234,108 @@ class ScoreAnalyzer:
                 start_event_idx=event_counter,
             )
             analysis.pages.append(page_res)
-            analysis.events.extend(page_res.events)
 
-        analysis.total_beats = cumulative_beat
         analysis.total_measures = measure_counter
+        self.rebuild_timeline(analysis, beats_per_measure=beats_per_measure, enable_repeats=enable_repeats)
         return analysis
+
+    @staticmethod
+    def rebuild_timeline(
+        analysis: ScoreAnalysis,
+        beats_per_measure: float,
+        enable_repeats: bool = True,
+    ) -> None:
+        """依實體小節的前後反覆記號 (||: ... :||) 動態展開第 1 遍與第 2 遍演奏時間軸（無須重跑影像處理）"""
+        old_bpm_beats = max(0.25, analysis.beats_per_measure)
+        beat_scale = beats_per_measure / old_bpm_beats
+        analysis.beats_per_measure = beats_per_measure
+        analysis.enable_repeats = enable_repeats
+        analysis.events.clear()
+        analysis.playback_measures.clear()
+        analysis.repeat_sections.clear()
+
+        phys_measures: List[MeasureInfo] = []
+        for p in analysis.pages:
+            p.events.clear()
+            for st in p.staves:
+                for m in st.measures:
+                    # 按新拍號等比例縮放小節內原始音符時長
+                    if abs(beat_scale - 1.0) > 1e-6:
+                        for ev0 in m.notes:
+                            ev0.duration_beats *= beat_scale
+                    phys_measures.append(m)
+
+        if not phys_measures:
+            analysis.total_beats = 0.0
+            return
+
+        # 解析反覆區段並產生播放小節序列 [(MeasureInfo, pass_num, jump_to_measure)]
+        playback_plan: List[Tuple[MeasureInfo, int, int]] = []
+        anchor_idx = 0
+        for i, m in enumerate(phys_measures):
+            if m.repeat_start:
+                anchor_idx = i
+            jump_target = 0
+            if m.repeat_end:
+                start_m = phys_measures[anchor_idx].measure_number
+                end_m = m.measure_number + max(0, m.rest_measures - 1)
+                analysis.repeat_sections.append((start_m, end_m))
+                if enable_repeats:
+                    jump_target = start_m
+
+            playback_plan.append((m, 1, jump_target))
+            if enable_repeats and m.repeat_end:
+                for j in range(anchor_idx, i + 1):
+                    playback_plan.append((phys_measures[j], 2, 0))
+                anchor_idx = min(len(phys_measures) - 1, i + 1)
+
+        cur_beat = 0.0
+        cur_ev_idx = 0
+        for m, pass_num, jump_target in playback_plan:
+            m_dur = beats_per_measure * (m.rest_measures if m.rest_measures > 0 else 1)
+            m_b_start = cur_beat
+            m_b_end = cur_beat + m_dur
+
+            if pass_num == 1:
+                m.beat_start = m_b_start
+                m.beat_end = m_b_end
+
+            analysis.playback_measures.append(
+                PlaybackMeasure(
+                    measure=m,
+                    beat_start=m_b_start,
+                    beat_end=m_b_end,
+                    repeat_pass=pass_num,
+                    jump_to_measure=jump_target,
+                )
+            )
+
+            local_beat = m_b_start
+            for ev_orig in m.notes:
+                cur_ev_idx += 1
+                ev_play = copy.copy(ev_orig)
+                ev_play.event_index = cur_ev_idx
+                ev_play.beat_offset = local_beat
+                ev_play.repeat_pass = pass_num
+                ev_play.repeat_start = m.repeat_start
+                ev_play.repeat_end = m.repeat_end
+                ev_play.repeat_jump_to = jump_target
+                analysis.events.append(ev_play)
+
+                if pass_num == 1:
+                    ev_orig.event_index = cur_ev_idx
+                    ev_orig.beat_offset = local_beat
+                    ev_orig.repeat_pass = 1
+                    ev_orig.repeat_start = m.repeat_start
+                    ev_orig.repeat_end = m.repeat_end
+                    ev_orig.repeat_jump_to = jump_target
+                    analysis.pages[m.page_index].events.append(ev_orig)
+
+                local_beat += ev_play.duration_beats
+
+            cur_beat = m_b_end
+
+        analysis.total_beats = cur_beat
 
     def _analyze_single_page(
         self,
@@ -268,36 +406,62 @@ class ScoreAnalyzer:
                     float(np.clip(oy / max(1.0, float(h)), 0.0, 1.0)),
                 )
 
-            # 5. 在 100% 拉直的五線譜帶上偵測譜頭結束位置、獨立音符、橫槓與小節線
+            # 5. 在 100% 拉直的五線譜帶上偵測譜頭結束位置、獨立音符、橫槓、小節線與反覆記號 (||: / :|| / :||:)
             raw_notes, horiz_bars, header_end_x = self._detect_notes_and_bars(
                 strip_bin, sy1, sy2, sp, xl, xr
             )
             main_note_pts = [(n.x, n.y) for n in raw_notes if not n.is_grace]
-            barlines = self._detect_barlines(
+            bar_infos = self._detect_barlines_and_repeats(
                 strip_bin, sy1, sy2, sp, xl, xr, main_note_pts, horiz_bars
             )
 
-            # 6. 過濾緊鄰小節線的反覆記號雙點 (|: / :|，寬度 < 0.85*sp 且距小節線 < 1.45*sp)
-            if barlines:
+            # 6. 過濾緊鄰小節線的反覆記號雙點 (|: / :|，寬度 < 0.85*sp 且距小節線 < 1.55*sp)，並清除誤吸反覆點的假附點
+            if bar_infos:
                 raw_notes = [
                     n for n in raw_notes
                     if not (
                         n.width < sp * 0.85
-                        and any(abs(n.x - bx) < sp * 1.45 for bx in barlines)
+                        and any(b.x_left - sp * 1.50 <= n.x <= b.x_right + sp * 1.50 for b in bar_infos)
                     )
                 ]
+                for n in raw_notes:
+                    if n.is_dotted and any(
+                        b.repeat_end_left and 0.0 < (b.x_left - n.x) <= sp * 2.4 for b in bar_infos
+                    ):
+                        n.is_dotted = False
 
-            valid_bars = [bx for bx in barlines if bx > header_end_x + sp * 1.2]
-            seg_edges = [header_end_x] + valid_bars
-            if not valid_bars or (xr - seg_edges[-1]) > sp * 3.0:
-                seg_edges.append(float(xr))
+            # 檢查譜頭正後方是否緊接著前反覆記號 ||:
+            header_rep_start = any(
+                b.repeat_start_right and abs(b.x_center - header_end_x) <= sp * 1.25
+                for b in bar_infos
+            )
+            valid_bars = [b for b in bar_infos if b.x_center > header_end_x + sp * 1.25]
 
-            clean_edges = [seg_edges[0]]
-            for ex in seg_edges[1:]:
-                if ex - clean_edges[-1] >= sp * 2.4:
-                    clean_edges.append(ex)
+            seg_edges: List[_EdgeMark] = [_EdgeMark(x=header_end_x, repeat_start_right=header_rep_start)]
+            for b in valid_bars:
+                seg_edges.append(
+                    _EdgeMark(
+                        x=b.x_center,
+                        repeat_end_left=b.repeat_end_left,
+                        repeat_start_right=b.repeat_start_right,
+                    )
+                )
+            if not valid_bars or (xr - seg_edges[-1].x) > sp * 3.0:
+                end_rep = any(
+                    b.repeat_end_left and abs(b.x_center - float(xr)) <= sp * 3.0
+                    for b in bar_infos
+                )
+                seg_edges.append(_EdgeMark(x=float(xr), repeat_end_left=end_rep))
+
+            clean_edges: List[_EdgeMark] = [seg_edges[0]]
+            for em in seg_edges[1:]:
+                if em.x - clean_edges[-1].x >= sp * 2.4:
+                    clean_edges.append(em)
+                else:
+                    clean_edges[-1].repeat_end_left = clean_edges[-1].repeat_end_left or em.repeat_end_left
+                    clean_edges[-1].repeat_start_right = clean_edges[-1].repeat_start_right or em.repeat_start_right
             if len(clean_edges) < 2:
-                clean_edges = [header_end_x, float(xr)]
+                clean_edges = [_EdgeMark(x=header_end_x), _EdgeMark(x=float(xr))]
 
             # 建立此行五線譜隨 x 變化的精確上下軌跡（供 UI 繪製貼合傾斜/彎曲譜面的高亮帶與游標）
             sample_xs = np.linspace(float(xl), float(xr), 17)
@@ -314,7 +478,7 @@ class ScoreAnalyzer:
                 x_left_norm=float(xl) / float(w),
                 x_right_norm=float(xr) / float(w),
                 spacing_norm=sp / float(h),
-                barlines_norm=[float(bx) / float(w) for bx in valid_bars],
+                barlines_norm=[float(b.x_center) / float(w) for b in valid_bars],
                 curve_xs_norm=curve_xs_norm,
                 curve_y_tops_norm=curve_y_tops_norm,
                 staff_height_norm=staff_h_norm,
@@ -323,8 +487,12 @@ class ScoreAnalyzer:
 
             # 7. 建立每個小節與節拍時間軸
             for m_i in range(len(clean_edges) - 1):
-                mx1 = clean_edges[m_i]
-                mx2 = clean_edges[m_i + 1]
+                e_left = clean_edges[m_i]
+                e_right = clean_edges[m_i + 1]
+                mx1 = e_left.x
+                mx2 = e_right.x
+                m_rep_start = e_left.repeat_start_right
+                m_rep_end = e_right.repeat_end_left
                 m_width = max(1.0, mx2 - mx1)
 
                 # 尋找此小節內的五線譜中央粗橫條（H-bar 多小節休止符：位於小節內部且非整條譜線）
@@ -397,6 +565,8 @@ class ScoreAnalyzer:
                         beat_start=m_beat_start,
                         beat_end=m_beat_end,
                         rest_measures=rest_count,
+                        repeat_start=m_rep_start,
+                        repeat_end=m_rep_end,
                     )
                     cx_n, cy_n = to_page_norm(mcx, 0.5 * (sy1 + sy2))
                     cur_ev_idx += 1
@@ -438,6 +608,8 @@ class ScoreAnalyzer:
                     y_bot_norm=m_yb_n,
                     beat_start=m_beat_start,
                     beat_end=m_beat_end,
+                    repeat_start=m_rep_start,
+                    repeat_end=m_rep_end,
                 )
 
                 durations, note_types = self._classify_and_assign_durations(
@@ -618,16 +790,26 @@ class ScoreAnalyzer:
             proj = np.sum(warped, axis=1)
             return float(np.sum(np.diff(proj) ** 2))
 
-        max_dy = w * math.tan(math.radians(4.5))
-        best_dy = 0.0
+        # 以分片追蹤點對的 Theil-Sen 中位數斜率作為穩健初值，在 ±1.2° 範圍內精搜全寬最佳斜率（完全免疫漸強弱記號 < > 干擾）
+        tx_trk = np.array([c[0] for c in track], dtype=np.float64)
+        ty_trk = np.array([0.5 * (c[1] + c[2]) for c in track], dtype=np.float64)
+        pair_slopes = []
+        for i_p in range(len(tx_trk)):
+            for j_p in range(i_p + 1, len(tx_trk)):
+                if tx_trk[j_p] - tx_trk[i_p] >= w * 0.15:
+                    pair_slopes.append((ty_trk[j_p] - ty_trk[i_p]) / (tx_trk[j_p] - tx_trk[i_p]))
+        init_dy = float(np.median(pair_slopes) * w) if pair_slopes else 0.0
+
+        search_span = w * math.tan(math.radians(1.5))
+        best_dy = init_dy
         best_score = -1.0
-        for dy_cand in np.linspace(-max_dy, max_dy, 45):
+        for dy_cand in np.linspace(init_dy - search_span, init_dy + search_span, 33):
             sc = eval_slope_sharpness(float(dy_cand))
             if sc > best_score:
                 best_score = sc
                 best_dy = float(dy_cand)
 
-        for dy_cand in np.linspace(best_dy - max_dy / 18.0, best_dy + max_dy / 18.0, 21):
+        for dy_cand in np.linspace(best_dy - search_span / 12.0, best_dy + search_span / 12.0, 17):
             sc = eval_slope_sharpness(float(dy_cand))
             if sc > best_score:
                 best_score = sc
@@ -964,6 +1146,7 @@ class ScoreAnalyzer:
                     width=float(bw),
                     height=float(bh),
                     in_staff_mid=in_mid,
+                    n_stems=b_nstems,
                 )
             )
 
@@ -1171,7 +1354,7 @@ class ScoreAnalyzer:
         return merged, horiz_bars, header_end_x
 
     @staticmethod
-    def _detect_barlines(
+    def _detect_barlines_and_repeats(
         strip_bin: np.ndarray,
         sy1: float,
         sy2: float,
@@ -1179,53 +1362,124 @@ class ScoreAnalyzer:
         xl: int,
         xr: int,
         note_pts: List[Tuple[float, float]],
-        horiz_bars: List[_HorizBar],
-    ) -> List[float]:
-        """在水平拉直的五線譜帶內偵測小節線（嚴格排除音符符幹與連槓端點）"""
+        horiz_bars: Optional[List[_HorizBar]] = None,
+    ) -> List[_BarlineInfo]:
+        """在水平拉直的五線譜帶內偵測小節線與前/後/雙向反覆記號 (||: / :|| / :||:)"""
         iy1 = max(0, int(round(sy1)))
         iy2 = min(strip_bin.shape[0], int(round(sy2)) + 1)
         staff_h = max(1, iy2 - iy1)
         if staff_h < 12:
             return []
 
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(4, int(staff_h * 0.88))))
-        v_lines = cv2.morphologyEx(strip_bin[iy1:iy2, xl:xr], cv2.MORPH_OPEN, v_kernel)
+        xr_pad = min(strip_bin.shape[1], xr + 4)
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(4, int(staff_h * 0.80))))
+        v_lines = cv2.morphologyEx(strip_bin[iy1:iy2, xl:xr_pad], cv2.MORPH_OPEN, v_kernel)
         v_proj = np.sum(v_lines > 0, axis=0)
-        bx = np.where(v_proj > staff_h * 0.85)[0]
+        bx = np.where(v_proj > staff_h * 0.78)[0]
         if len(bx) == 0:
             return []
 
-        def is_valid_barline(cand_x: float) -> bool:
+        # 擷取第二間 (sy1+sp .. sy1+2*sp) 與第三間 (sy1+2*sp .. sy1+3*sp) 的無幹小圓點，用於辨識反覆記號雙點 ":"
+        by0 = max(0, int(round(sy1 + 0.80 * sp)))
+        by1_d = min(strip_bin.shape[0], int(round(sy1 + 3.20 * sp)))
+        dots: List[Tuple[float, float, int, int, int]] = []
+        if by1_d > by0 + 6:
+            band = strip_bin[by0:by1_d, :].copy()
+            h_line = cv2.morphologyEx(band, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, int(sp * 1.2)), 1)))
+            v_stem = cv2.morphologyEx(band, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(6, int(sp * 1.1)))))
+            dots_img = cv2.subtract(cv2.subtract(band, h_line), v_stem)
+            nl, _, d_st, d_ct = cv2.connectedComponentsWithStats(dots_img)
+            for l_i in range(1, nl):
+                dw = int(d_st[l_i, cv2.CC_STAT_WIDTH])
+                dh = int(d_st[l_i, cv2.CC_STAT_HEIGHT])
+                da = int(d_st[l_i, cv2.CC_STAT_AREA])
+                dcx = float(d_ct[l_i][0])
+                dcy = float(by0) + float(d_ct[l_i][1])
+                if 2 <= dw <= sp * 1.05 and 2 <= dh <= sp * 0.95 and sp * sp * 0.028 <= da <= sp * sp * 0.45:
+                    dots.append((dcx, dcy, dw, dh, da))
+
+        def is_valid_barline(c_left: float, c_right: float) -> bool:
+            cand_x = 0.5 * (c_left + c_right)
             if any(abs(cand_x - nx) <= sp * 0.88 for nx, _ in note_pts):
                 return False
-            # 真實小節線止於第一線與第五線；若該垂直線本身直接向上或向下延伸超過 0.65*sp（例如音符符幹），則非小節線
-            cx_i = int(np.clip(round(cand_x), 1, strip_bin.shape[1] - 2))
-            up_r1 = max(0, iy1 - int(round(sp * 0.85)))
-            up_r2 = max(0, iy1 - 2)
-            dn_r1 = min(strip_bin.shape[0], iy2 + 2)
-            dn_r2 = min(strip_bin.shape[0], iy2 + int(round(sp * 0.85)))
-            if up_r2 > up_r1 + 2:
-                if float(np.mean(np.max(strip_bin[up_r1:up_r2, cx_i - 1:cx_i + 2], axis=1) > 0)) > 0.75:
+            # 單細線若連接多符幹節奏連槓 (n_stems >= 2 且寬度 <= 11.5*sp)，必為十六/八分音符尾端符幹而非小節線
+            if (c_right - c_left) < sp * 0.55 and horiz_bars:
+                if any(
+                    hb.n_stems >= 2
+                    and hb.width <= sp * 11.5
+                    and (hb.x1 - sp * 0.45 <= cand_x <= hb.x2 + sp * 0.45)
+                    for hb in horiz_bars
+                ):
                     return False
-            if dn_r2 > dn_r1 + 2:
-                if float(np.mean(np.max(strip_bin[dn_r1:dn_r2, cx_i - 1:cx_i + 2], axis=1) > 0)) > 0.75:
-                    return False
+            if (c_right - c_left) < sp * 0.55:
+                cx_i = int(np.clip(round(cand_x), 1, strip_bin.shape[1] - 2))
+                up_r1 = max(0, iy1 - int(round(sp * 1.35)))
+                up_r2 = max(0, iy1 - int(round(sp * 0.45)))
+                dn_r1 = min(strip_bin.shape[0], iy2 + int(round(sp * 0.45)))
+                dn_r2 = min(strip_bin.shape[0], iy2 + int(round(sp * 1.35)))
+                if up_r2 > up_r1 + 2:
+                    if float(np.mean(np.max(strip_bin[up_r1:up_r2, cx_i - 1:cx_i + 2], axis=1) > 0)) > 0.80:
+                        return False
+                if dn_r2 > dn_r1 + 2:
+                    if float(np.mean(np.max(strip_bin[dn_r1:dn_r2, cx_i - 1:cx_i + 2], axis=1) > 0)) > 0.80:
+                        return False
             return True
 
-        barlines: List[float] = []
+        def has_repeat_dots(x_min: float, x_max: float, is_double_bar: bool, span_px: float) -> bool:
+            # 音樂排版規範：反覆記號必搭配雙小節線/粗細小節線（總跨度 >= 0.50*sp），單一細小節線絕非反覆記號！
+            if span_px < sp * 0.50:
+                return False
+            up = [d for d in dots if x_min <= d[0] <= x_max and (sy1 + 1.05 * sp) <= d[1] <= (sy1 + 1.95 * sp)]
+            dn = [d for d in dots if x_min <= d[0] <= x_max and (sy1 + 2.05 * sp) <= d[1] <= (sy1 + 2.95 * sp)]
+            for u in up:
+                for v in dn:
+                    if abs(u[0] - v[0]) <= sp * 0.45:
+                        return True
+            if is_double_bar:
+                centered = [
+                    d for d in (up + dn)
+                    if d[4] >= sp * sp * 0.10
+                    and 0.50 <= (d[2] / max(1.0, float(d[3]))) <= 1.85
+                    and (
+                        ((sy1 + 1.22 * sp) <= d[1] <= (sy1 + 1.78 * sp))
+                        or ((sy1 + 2.22 * sp) <= d[1] <= (sy1 + 2.78 * sp))
+                    )
+                ]
+                if centered:
+                    return True
+            return False
+
+        clusters: List[Tuple[int, int]] = []
         b_start = b_prev = int(bx[0])
         for x in bx[1:]:
             x = int(x)
-            if x > b_prev + max(5, int(sp * 1.0)):
-                cand_x = xl + (b_start + b_prev) / 2.0
-                if is_valid_barline(cand_x):
-                    barlines.append(cand_x)
+            if x > b_prev + max(5, int(sp * 1.15)):
+                clusters.append((b_start, b_prev))
                 b_start = x
             b_prev = x
-        cand_x = xl + (b_start + b_prev) / 2.0
-        if is_valid_barline(cand_x):
-            barlines.append(cand_x)
-        return barlines
+        clusters.append((b_start, b_prev))
+
+        bar_infos: List[_BarlineInfo] = []
+        for bs, bp in clusters:
+            c_l = float(xl + bs)
+            c_r = float(xl + bp)
+            if not is_valid_barline(c_l, c_r):
+                continue
+            vc_slice = v_proj[bs:bp + 1]
+            span_px = c_r - c_l
+            is_double = (span_px >= sp * 0.55) and (int(np.min(vc_slice)) == 0 or span_px >= sp * 0.75)
+            rep_end = has_repeat_dots(c_l - sp * 1.48, c_l - 1.0, is_double, span_px)
+            rep_start = has_repeat_dots(c_r + 1.0, c_r + sp * 1.48, is_double, span_px)
+            bar_infos.append(
+                _BarlineInfo(
+                    x_center=0.5 * (c_l + c_r),
+                    x_left=c_l,
+                    x_right=c_r,
+                    repeat_end_left=rep_end,
+                    repeat_start_right=rep_start,
+                )
+            )
+        return bar_infos
 
     @staticmethod
     def _y_to_treble_pitch(ny: float, y_bot: float, sp: float) -> Tuple[int, str]:

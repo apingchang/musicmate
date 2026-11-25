@@ -197,6 +197,70 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
             self.assertEqual(st.measures[0].rest_measures, 2)
             self.assertEqual(len(st.measures[1].notes), 3)
 
+    def test_repeat_signs_detection_and_playback_unrolling(self):
+        """驗證前反覆記號 ||: 與後反覆記號 :|| 能精準辨識，並自動展開第 1 遍與第 2 遍回跳播放及支援開關切換"""
+        img = np.full((300, 1100, 3), 255, dtype=np.uint8)
+        sp = 14
+        sy = 120
+        for i in range(5):
+            cv2.line(img, (60, sy + i * sp), (1040, sy + i * sp), (20, 20, 20), 2)
+        y_top, y_bot = sy, sy + 4 * sp
+
+        # M1 (x=120..320): 一般引子小節 (1 顆音符)
+        cv2.ellipse(img, (230, sy + 2 * sp), (8, 6), -15, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (237, sy - sp), (237, sy + 2 * sp), (15, 15, 15), 2)
+
+        # 前反覆記號 ||: 於 x=320 (粗線 + 細線 + 右側第二、三間雙圓點) -> M2 起點
+        cv2.rectangle(img, (316, y_top), (322, y_bot), (15, 15, 15), -1)
+        cv2.line(img, (327, y_top), (327, y_bot), (15, 15, 15), 2)
+        cv2.circle(img, (336, int(sy + 1.5 * sp)), 3, (15, 15, 15), -1)
+        cv2.circle(img, (336, int(sy + 2.5 * sp)), 3, (15, 15, 15), -1)
+
+        # M2 (x=327..660): 1 顆音符 + 一般單細小節線 x=660
+        cv2.ellipse(img, (490, sy + sp), (8, 6), -15, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (497, sy - sp), (497, sy + sp), (15, 15, 15), 2)
+        cv2.line(img, (660, y_top), (660, y_bot), (20, 20, 20), 2)
+
+        # M3 (x=660..1035): 1 顆音符 + 後反覆記號 :|| 於結尾 x=1030 (左側雙圓點 + 細線 + 粗線)
+        cv2.ellipse(img, (830, sy + 2 * sp), (8, 6), -15, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (837, sy - sp), (837, sy + 2 * sp), (15, 15, 15), 2)
+        cv2.circle(img, (1019, int(sy + 1.5 * sp)), 3, (15, 15, 15), -1)
+        cv2.circle(img, (1019, int(sy + 2.5 * sp)), 3, (15, 15, 15), -1)
+        cv2.line(img, (1028, y_top), (1028, y_bot), (15, 15, 15), 2)
+        cv2.rectangle(img, (1033, y_top), (1039, y_bot), (15, 15, 15), -1)
+
+        # 1. 驗證啟用反覆時：實體 3 小節 (M1, M2, M3)，反覆區段為 [(2, 3)]，播放順序為 M1 -> M2(1) -> M3(1) -> M2(2) -> M3(2) 共 5 小節！
+        res_on = self.analyzer.analyze_pages([img], beats_per_measure=2.0, enable_repeats=True)
+        self.assertEqual(res_on.total_measures, 3)
+        self.assertEqual(res_on.repeat_sections, [(2, 3)])
+        seq_on = [(pm.measure.measure_number, pm.repeat_pass) for pm in res_on.playback_measures]
+        self.assertEqual(seq_on, [(1, 1), (2, 1), (3, 1), (2, 2), (3, 2)])
+        self.assertAlmostEqual(res_on.total_beats, 10.0, places=2)
+
+        # 2. 驗證 UI 開關切換（關閉反覆 -> 單遍 6 拍；重新開啟 -> 雙遍 10 拍）
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        self.temp_files.append(path)
+
+        page = AutoScrollPage()
+        page.sound_btn.setChecked(False)
+        page.time_sig_combo.setCurrentText("2/4")
+        self.assertTrue(page.load_file(path))
+        self.assertAlmostEqual(page._analysis.total_beats, 10.0, places=2)
+
+        # 步進到第 4 個播放小節應跳回 M2 [第 2 遍]
+        for _ in range(3):
+            page._on_next_measure()
+        _, ev_pass2 = page._find_event_at_beat(page._current_beat)
+        self.assertEqual(ev_pass2.measure_number, 2)
+        self.assertEqual(ev_pass2.repeat_pass, 2)
+        self.assertIn("第2遍", page.measure_label.text())
+
+        # 關閉「啟用反覆」後改為直通 3 小節 (6.0 拍)
+        page.repeat_chk.setChecked(False)
+        self.assertAlmostEqual(page._analysis.total_beats, 6.0, places=2)
+
     def test_measure_step_and_note_step_calibration_ui(self):
         """驗證逐小節播放、逐音符步進與詳細音符資訊列及偵測標記疊層"""
         rgb = _create_synthetic_score_rgb()
