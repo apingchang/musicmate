@@ -305,7 +305,10 @@ class ScoreAnalyzer:
         cur_beat = 0.0
         cur_ev_idx = 0
         for m, pass_num, jump_target in playback_plan:
-            m_dur = beats_per_measure * (m.rest_measures if m.rest_measures > 0 else 1)
+            if m.rest_measures > 0 or not m.notes:
+                m_dur = beats_per_measure * max(1, m.rest_measures)
+            else:
+                m_dur = sum(ev0.duration_beats for ev0 in m.notes)
             m_b_start = cur_beat
             m_b_end = cur_beat + m_dur
 
@@ -642,6 +645,12 @@ class ScoreAnalyzer:
                 durations, note_types = self._classify_and_assign_durations(
                     m_notes_all, mx2, sp, beats_per_measure
                 )
+                # 若音符帶有延長記號 (Fermata 𝄐)，自動將演奏持續拍數延長為 1.75 倍
+                for idx_d, n_d in enumerate(m_notes_all):
+                    if "延長記號" in n_d.articulation and not n_d.is_grace:
+                        durations[idx_d] *= 1.75
+                m_beat_end = m_beat_start + sum(durations)
+                measure_info.beat_end = m_beat_end
                 local_beat = m_beat_start
                 total_in_m = len(m_notes_all)
                 # 同小節內臨時升降記號延續表 {diatonic_step: accidental (-1/0/+1)}，跨小節自動重置
@@ -732,21 +741,26 @@ class ScoreAnalyzer:
                     elif ps[r] > peaks[-1][1]:
                         peaks[-1] = (float(r), float(ps[r]))
 
-            p_ys = [p[0] for p in peaks]
-            combs: List[Tuple[float, float, float, float]] = []
-            idx = 0
-            while idx + 4 < len(p_ys):
-                grp = p_ys[idx:idx + 5]
-                diffs = np.diff(grp)
+            cand_combs: List[Tuple[float, float, float, float, float]] = []
+            for idx in range(max(0, len(peaks) - 4)):
+                grp_y = [peaks[idx + k][0] for k in range(5)]
+                grp_s = [peaks[idx + k][1] for k in range(5)]
+                diffs = np.diff(grp_y)
                 med = float(np.median(diffs))
                 if min_sp <= med <= max_sp and np.all(np.abs(diffs - med) <= max(2.2, med * 0.22)):
-                    combs.append((float(xc), grp[0], grp[4], med))
-                    idx += 5
-                else:
-                    idx += 1
+                    # 以總強度 + 2.5 倍最弱線強度評分，確保 5 條完整譜線必勝過「4 條譜線 + 1 條高音加線/反覆括號線」！
+                    c_score = float(sum(grp_s) + 2.5 * min(grp_s))
+                    cand_combs.append((c_score, float(xc), grp_y[0], grp_y[4], med))
+            cand_combs.sort(key=lambda item: item[0], reverse=True)
+            combs: List[Tuple[float, float, float, float]] = []
+            for _, c_xc, cy0, cy4, cmed in cand_combs:
+                c_mid = 0.5 * (cy0 + cy4)
+                if all(abs(c_mid - 0.5 * (e[1] + e[2])) >= cmed * 3.5 for e in combs):
+                    combs.append((c_xc, cy0, cy4, cmed))
+            combs.sort(key=lambda e: e[1])
             slice_combs.append(combs)
 
-        # 跨分片串聯同一行五線譜軌跡
+        # 跨分片串聯同一行五線譜軌跡（限制相鄰分片跳動 < 0.75*sp，徹底杜絕跨片誤跳 1 個譜間距！）
         tracks: List[List[Tuple[float, float, float, float]]] = []
         for combs in slice_combs:
             for c in combs:
@@ -765,7 +779,8 @@ class ScoreAnalyzer:
                         ypred = 0.5 * (ly0 + ly4) + slope * (xc - lx)
                     else:
                         ypred = 0.5 * (ly0 + ly4)
-                    if abs(ymid - ypred) <= lsp * 1.65 and abs(sp - lsp) <= lsp * 0.22:
+                    max_jump = max(lsp * 0.72, abs(xc - lx) * 0.085)
+                    if abs(ymid - ypred) <= max_jump and abs(sp - lsp) <= lsp * 0.22:
                         d = abs(ymid - ypred)
                         if d < best_dist:
                             best_dist = d
@@ -842,9 +857,11 @@ class ScoreAnalyzer:
         init_dy = float(np.median(pair_slopes) * w) if pair_slopes else 0.0
 
         search_span = w * math.tan(math.radians(1.5))
+        dy_lo = min(init_dy - search_span, -search_span * 0.8)
+        dy_hi = max(init_dy + search_span, search_span * 0.8)
         best_dy = init_dy
         best_score = -1.0
-        for dy_cand in np.linspace(init_dy - search_span, init_dy + search_span, 33):
+        for dy_cand in np.linspace(dy_lo, dy_hi, 37):
             sc = eval_slope_sharpness(float(dy_cand))
             if sc > best_score:
                 best_score = sc
@@ -867,7 +884,7 @@ class ScoreAnalyzer:
         full_proj = np.sum(aligned_horiz > 0, axis=1).astype(np.float32)
         ps_full = np.convolve(full_proj, np.array([0.25, 0.6, 1.0, 0.6, 0.25], dtype=np.float32), mode="same")
 
-        # 5 條線梳狀濾波器搜尋：找出總能量最高的 5 等距長譜線（完全免疫短橫槓與漸強弱記號！）
+        # 5 條線梳狀濾波器搜尋：同時要求總能量與最弱單線能量最高，徹底杜絕上加線/反覆括號導致整框上移 1 線！
         best_comb_score = -1.0
         best_y0_rel = float(bh / 2.0 - 2.0 * sp_est)
         best_sp = sp_est
@@ -877,7 +894,8 @@ class ScoreAnalyzer:
             if max_y0 <= 1:
                 continue
             y0_candidates = np.arange(1, max_y0)
-            comb_vals = np.sum(ps_full[y0_candidates[:, None] + offsets_5[None, :]], axis=1)
+            teeth_5 = ps_full[y0_candidates[:, None] + offsets_5[None, :]]
+            comb_vals = np.sum(teeth_5, axis=1) + 2.5 * np.min(teeth_5, axis=1)
             idx_max = int(np.argmax(comb_vals))
             val_max = float(comb_vals[idx_max])
             if val_max > best_comb_score:
@@ -1200,7 +1218,105 @@ class ScoreAnalyzer:
                 )
             )
 
-        # 4. 同時減去長橫槓與細直符幹，讓每顆符頭 100% 獨立分離
+        # 3b. 先在未經侵蝕的原解析度影像上擷取「白邊隔離圓點」、「保持音短橫槓 (-)」與「延長記號 Fermata (𝄐 / 𝄑)」
+        raw_roi = strip_bin[:, xl:xr]
+        h_long = cv2.morphologyEx(raw_roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(12, int(round(sp * 1.25))), 1)))
+        no_staff_roi = cv2.subtract(raw_roi, h_long)
+        v_tall = cv2.morphologyEx(raw_roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(8, int(round(sp * 1.15))))))
+        dot_cand_img = cv2.subtract(no_staff_roi, v_tall)
+
+        num_d, _, dstats, dcent = cv2.connectedComponentsWithStats(dot_cand_img)
+        true_dots: List[Tuple[float, float]] = []
+        fermata_dots: List[Tuple[float, float]] = []
+        for dlbl in range(1, num_d):
+            dx0 = int(dstats[dlbl, cv2.CC_STAT_LEFT])
+            dy0 = int(dstats[dlbl, cv2.CC_STAT_TOP])
+            dw = int(dstats[dlbl, cv2.CC_STAT_WIDTH])
+            dh = int(dstats[dlbl, cv2.CC_STAT_HEIGHT])
+            da = int(dstats[dlbl, cv2.CC_STAT_AREA])
+            dcx = float(xl) + float(dcent[dlbl][0])
+            dcy = float(dcent[dlbl][1])
+
+            rx0, rx1 = max(0, dx0 - 2), min(no_staff_roi.shape[1], dx0 + dw + 2)
+            ry0, ry1_b = max(0, dy0 - 2), min(no_staff_roi.shape[0], dy0 + dh + 2)
+            ring_ink = int(np.sum(no_staff_roi[ry0:ry1_b, rx0:rx1] > 0)) - da
+            ring_area = max(1, (rx1 - rx0) * (ry1_b - ry0) - dw * dh)
+            ring_ratio = ring_ink / float(ring_area)
+
+            if (
+                3 <= dw <= max(6, int(round(sp * 0.92)))
+                and 3 <= dh <= max(6, int(round(sp * 0.85)))
+                and 0.48 <= (dw / max(1.0, float(dh))) <= 1.90
+                and sp * sp * 0.10 <= da <= sp * sp * 0.52
+                and (da / max(1.0, float(dw * dh))) >= 0.45
+                and ring_ratio <= 0.16
+            ):
+                fermata_dots.append((dcx, dcy))
+                if dw <= max(5, int(round(sp * 0.62))) and dh <= max(5, int(round(sp * 0.62))) and da <= sp * sp * 0.38:
+                    true_dots.append((dcx, dcy))
+
+        # 偵測延長記號 Fermata (𝄐 / 𝄑)：直接在原始 raw_roi 上尋找五線譜上方或下方、朝譜面內凹的孤立彎弧，且正中央開口內嵌一顆圓點！
+        fermata_zones: List[Tuple[float, float, float, float, float]] = []
+        used_f_dots: List[Tuple[float, float]] = []
+        num_raw, _, rstats, rcent = cv2.connectedComponentsWithStats(raw_roi)
+        for nlbl in range(1, num_raw):
+            ax0 = int(rstats[nlbl, cv2.CC_STAT_LEFT])
+            ay0 = int(rstats[nlbl, cv2.CC_STAT_TOP])
+            aw = int(rstats[nlbl, cv2.CC_STAT_WIDTH])
+            ah = int(rstats[nlbl, cv2.CC_STAT_HEIGHT])
+            if not (sp * 1.25 <= aw <= sp * 3.65 and sp * 0.45 <= ah <= sp * 2.15):
+                continue
+            is_upper_f = (ay0 + ah) <= (sy1 + sp * 0.35)
+            is_lower_f = ay0 >= (sy2 - sp * 0.35)
+            if not (is_upper_f or is_lower_f):
+                continue
+            arch_p = raw_roi[ay0:ay0 + ah, ax0:ax0 + aw] > 0
+            ew = max(1, aw // 5)
+            ys_mid = np.where(arch_p[:, aw // 3:max(aw // 3 + 1, 2 * aw // 3)])[0]
+            ys_l = np.where(arch_p[:, :ew])[0]
+            ys_r = np.where(arch_p[:, aw - ew:])[0]
+            if len(ys_mid) == 0 or len(ys_l) == 0 or len(ys_r) == 0:
+                continue
+            y_mid_m = float(np.mean(ys_mid))
+            y_end_m = 0.5 * (float(np.mean(ys_l)) + float(np.mean(ys_r)))
+            if is_upper_f and not (y_mid_m < y_end_m - 1.0):
+                continue
+            if is_lower_f and not (y_mid_m > y_end_m + 1.0):
+                continue
+            fcx = float(xl) + float(ax0) + aw * 0.5
+            matched_dots = [
+                (fdx, fdy) for fdx, fdy in fermata_dots
+                if abs(fdx - fcx) <= aw * 0.32
+                and (
+                    (is_upper_f and (ay0 + ah * 0.20) <= fdy <= (ay0 + ah + sp * 0.65))
+                    or (is_lower_f and (ay0 - sp * 0.65) <= fdy <= (ay0 + ah * 0.80))
+                )
+            ]
+            if matched_dots:
+                fermata_zones.append((float(xl + ax0 - 4), float(ay0 - 4), float(xl + ax0 + aw + 4), float(ay0 + ah + 4), fcx))
+                used_f_dots.extend(matched_dots)
+
+        if used_f_dots:
+            true_dots = [
+                (dx, dy) for dx, dy in true_dots
+                if all(math.hypot(dx - ux, dy - uy) > 3.5 for ux, uy in used_f_dots)
+            ]
+
+        tenuto_bars: List[Tuple[float, float]] = []
+        num_raw, _, rstats, rcent = cv2.connectedComponentsWithStats(raw_roi)
+        for rlbl in range(1, num_raw):
+            tw = int(rstats[rlbl, cv2.CC_STAT_WIDTH])
+            th = int(rstats[rlbl, cv2.CC_STAT_HEIGHT])
+            ta = int(rstats[rlbl, cv2.CC_STAT_AREA])
+            if (
+                sp * 0.65 <= tw <= sp * 1.55
+                and 1 <= th <= max(5, int(round(sp * 0.42)))
+                and (tw / max(1.0, float(th))) >= 2.3
+                and (ta / max(1.0, float(tw * th))) >= 0.68
+            ):
+                tenuto_bars.append((float(xl) + float(rcent[rlbl][0]), float(rcent[rlbl][1])))
+
+        # 4. 同時減去長橫槓與細直符幹，讓每顆實心符頭 100% 獨立分離
         roi_clean = cv2.subtract(vert_keep, cv2.dilate(beams_mask, np.ones((2, 2), np.uint8)))
         roi_clean = cv2.subtract(roi_clean, pure_stems)
 
@@ -1221,13 +1337,16 @@ class ScoreAnalyzer:
             cx, cy = float(centroids[lbl][0]), float(centroids[lbl][1])
             if cx < header_skip:
                 continue
+            abs_cx = xl + cx
+            if any(fx0 <= abs_cx <= fx1 and fy0 <= cy <= fy1 for fx0, fy0, fx1, fy1, _ in fermata_zones):
+                continue
 
             aspect = cw / max(1.0, float(ch))
             area_ratio = area / max(1.0, sp * sp)
 
-            # 若臨時升降號橫槓與右側符頭水平微觸連成寬區塊 (如 #G5, cw ≈ 2.0..3.4*sp)，自動切出右側獨立主符頭！
+            # 若臨時升降號橫槓與右側符頭水平微觸連成寬區塊 (如 #G5 / bB5, cw ≈ 1.78..3.45*sp)，自動切出右側獨立主符頭！
             if (
-                (sp * 1.95 < cw <= sp * 3.45)
+                (sp * 1.78 < cw <= sp * 3.45)
                 and (sp * 0.36 <= ch <= sp * 1.85)
                 and ((sy1 - sp * 2.5) <= cy <= (sy2 + sp * 2.5))
             ):
@@ -1285,6 +1404,14 @@ class ScoreAnalyzer:
             if is_grace_cand and n_stems == 0:
                 continue
 
+            # 位於五線譜上下界之外的真實實心音符必有符幹（排除無符幹之延長記號弧頂、圓滑線弧頂或文字殘影誤判為高音符頭！）
+            if (cy < sy1 - sp * 0.58 or cy > sy2 + sp * 0.58) and n_stems == 0:
+                sy_ext0 = max(0, ny - int(sp * 1.6))
+                sy_ext1 = min(roi.shape[0], ny + ch + int(sp * 1.6))
+                ext_stem = int(np.max(np.sum(pure_stems[sy_ext0:sy_ext1, sx0:sx1] > 0, axis=0))) if sx1 > sx0 else 0
+                if ext_stem < 4:
+                    continue
+
             candidates.append(
                 _RawNote(
                     x=xl + cx,
@@ -1318,9 +1445,12 @@ class ScoreAnalyzer:
             filtered_cands.append(c)
         candidates = filtered_cands
 
-        # 6. 空心符頭（二分音符 / 全音符）偵測
-        closed_roi = cv2.morphologyEx(roi_clean, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
-        contours, hierarchy = cv2.findContours(closed_roi, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        # 6. 空心符頭（二分音符 / 全音符）偵測：僅移除純水平譜線而不減去 pure_stems，確保二分音符側面符幹處圓環 100% 封閉不斷裂！
+        intact_for_hollow = cv2.subtract(roi, cv2.subtract(h_lines_only, vert_keep))
+        intact_for_hollow = cv2.morphologyEx(
+            intact_for_hollow, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        )
+        contours, hierarchy = cv2.findContours(intact_for_hollow, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is not None:
             hier = hierarchy[0]
             for c_idx, h_info in enumerate(hier):
@@ -1328,25 +1458,44 @@ class ScoreAnalyzer:
                 if parent_idx < 0:
                     continue
                 hx, hy, hw, hh = cv2.boundingRect(contours[c_idx])
-                _, _, ow, _ = cv2.boundingRect(contours[parent_idx])
                 hole_area = cv2.contourArea(contours[c_idx])
                 fill_ratio = hole_area / max(1.0, float(hw * hh))
                 hcx = hx + hw / 2.0
                 hcy = hy + hh / 2.0
                 if hcx < header_skip:
                     continue
+                abs_x = xl + hcx
+                if any(fx0 <= abs_x <= fx1 and fy0 <= hcy <= fy1 for fx0, fy0, fx1, fy1, _ in fermata_zones):
+                    continue
+                # 真實空心二分/全音符內孔必為橫向橢圓 (hw >= hh * 1.02)，可天然排除雙小節線窄縫與直立降記號 ♭ 圓肚！
                 if (
-                    (ow <= sp * 2.2)
-                    and (sp * 0.32 <= hw <= sp * 1.05)
-                    and (sp * 0.25 <= hh <= sp * 0.80)
-                    and (fill_ratio >= 0.52)
-                    and (sp * sp * 0.08 <= hole_area <= sp * sp * 0.65)
+                    (sp * 0.34 <= hw <= sp * 1.18)
+                    and (sp * 0.24 <= hh <= sp * 0.85)
+                    and (float(hw) >= float(hh) * 1.02)
+                    and (fill_ratio >= 0.35)
+                    and (sp * sp * 0.11 <= hole_area <= sp * sp * 0.72)
                     and ((sy1 - sp * 2.0) <= hcy <= (sy2 + sp * 2.0))
                 ):
-                    abs_x = xl + hcx
-                    if all(abs(abs_x - c.x) > sp * 0.65 for c in candidates if not c.is_grace):
-                        # 排除降記號 ♭ ("b" 形：左側單幹朝上、下方無幹且小內孔) 被誤判為空心二分音符！
-                        if hole_area < sp * sp * 0.30:
+                    # 確認內孔上下左右 4 側緊鄰皆有實質符頭黑邊包覆，且左右外側非連續寬黑塊
+                    t_rim = intact_for_hollow[max(0, hy - 4):max(1, hy), hx:hx + hw]
+                    b_rim = intact_for_hollow[min(roi.shape[0] - 1, hy + hh):min(roi.shape[0], hy + hh + 4), hx:hx + hw]
+                    l_rim = intact_for_hollow[hy:hy + hh, max(0, hx - 4):max(1, hx)]
+                    r_rim = intact_for_hollow[hy:hy + hh, min(roi.shape[1] - 1, hx + hw):min(roi.shape[1], hx + hw + 4)]
+                    if (
+                        t_rim.size == 0 or b_rim.size == 0 or l_rim.size == 0 or r_rim.size == 0
+                        or float(np.mean(t_rim > 0)) < 0.30
+                        or float(np.mean(b_rim > 0)) < 0.30
+                        or float(np.mean(l_rim > 0)) < 0.30
+                        or float(np.mean(r_rim > 0)) < 0.30
+                    ):
+                        continue
+
+                    if all(
+                        not (abs(abs_x - c.x) <= sp * 0.65 and abs(hcy - c.y) <= sp * 0.65 and c.area_ratio >= 0.98)
+                        for c in candidates if not c.is_grace
+                    ):
+                        # 排除降記號 ♭ ("b" 形) 或升降記號 ♯/♮ 內部小方孔誤判為空心二分音符！
+                        if hole_area < sp * sp * 0.36:
                             l_up = pure_stems[max(0, int(hcy - sp * 2.2)):max(1, int(hcy - sp * 0.3)), max(0, int(hx - sp * 0.45)):min(roi.shape[1], int(hcx))]
                             r_up = pure_stems[max(0, int(hcy - sp * 2.2)):max(1, int(hcy - sp * 0.3)), max(0, int(hcx)):min(roi.shape[1], int(hx + hw + sp * 0.45))]
                             all_dn = pure_stems[min(roi.shape[0] - 1, int(hcy + sp * 0.5)):min(roi.shape[0], int(hcy + sp * 2.0)), max(0, int(hx - sp * 0.4)):min(roi.shape[1], int(hx + hw + sp * 0.4))]
@@ -1355,6 +1504,14 @@ class ScoreAnalyzer:
                             dn_h = int(np.max(np.sum(all_dn > 0, axis=0))) if all_dn.size > 0 else 0
                             if lu_h >= int(sp * 0.9) and ru_h < int(sp * 0.5) and dn_h < int(sp * 0.5):
                                 continue
+                            if hole_area < sp * sp * 0.28 and lu_h >= int(sp * 0.7) and dn_h >= int(sp * 0.7):
+                                continue
+
+                        # 清除空心符頭上下邊緣在 nh_mask 中殘留的碎小假音符邊框碎片
+                        candidates = [
+                            c for c in candidates
+                            if not (abs(c.x - abs_x) <= sp * 0.75 and abs(c.y - hcy) <= sp * 0.85 and c.area_ratio < 0.98)
+                        ]
 
                         sx0 = max(0, int(hcx - sp * 0.9))
                         sx1 = min(roi.shape[1], int(hcx + sp * 0.9))
@@ -1368,8 +1525,8 @@ class ScoreAnalyzer:
                             _RawNote(
                                 x=abs_x,
                                 y=hcy,
-                                width=float(ow),
-                                area_ratio=1.1,
+                                width=float(hw + 6),
+                                area_ratio=1.15,
                                 is_grace=False,
                                 is_hollow=True,
                                 has_stem=has_stem,
@@ -1494,55 +1651,7 @@ class ScoreAnalyzer:
                 if up_s < int(sp * 0.7) and dn_s >= int(sp * 1.1) and has_lower_main_beam:
                     n.is_grace = False
 
-        # 8. 在未經垂直侵蝕的原解析度影像上精準偵測「白邊隔離真圓點（附點 / 跳音 .）」與「純獨立保持音橫線 (-)」
-        raw_roi = strip_bin[:, xl:xr]
-        h_long = cv2.morphologyEx(raw_roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(12, int(round(sp * 1.25))), 1)))
-        no_staff_roi = cv2.subtract(raw_roi, h_long)
-        v_tall = cv2.morphologyEx(raw_roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(8, int(round(sp * 1.15))))))
-        dot_cand_img = cv2.subtract(no_staff_roi, v_tall)
-
-        num_d, _, dstats, dcent = cv2.connectedComponentsWithStats(dot_cand_img)
-        true_dots: List[Tuple[float, float]] = []
-        for dlbl in range(1, num_d):
-            dx0 = int(dstats[dlbl, cv2.CC_STAT_LEFT])
-            dy0 = int(dstats[dlbl, cv2.CC_STAT_TOP])
-            dw = int(dstats[dlbl, cv2.CC_STAT_WIDTH])
-            dh = int(dstats[dlbl, cv2.CC_STAT_HEIGHT])
-            da = int(dstats[dlbl, cv2.CC_STAT_AREA])
-            dcx = float(xl) + float(dcent[dlbl][0])
-            dcy = float(dcent[dlbl][1])
-
-            rx0, rx1 = max(0, dx0 - 2), min(no_staff_roi.shape[1], dx0 + dw + 2)
-            ry0, ry1_b = max(0, dy0 - 2), min(no_staff_roi.shape[0], dy0 + dh + 2)
-            ring_ink = int(np.sum(no_staff_roi[ry0:ry1_b, rx0:rx1] > 0)) - da
-            ring_area = max(1, (rx1 - rx0) * (ry1_b - ry0) - dw * dh)
-            ring_ratio = ring_ink / float(ring_area)
-
-            if (
-                3 <= dw <= max(5, int(round(sp * 0.62)))
-                and 3 <= dh <= max(5, int(round(sp * 0.62)))
-                and 0.50 <= (dw / max(1.0, float(dh))) <= 1.85
-                and sp * sp * 0.11 <= da <= sp * sp * 0.38
-                and (da / max(1.0, float(dw * dh))) >= 0.45
-                and ring_ratio <= 0.16
-            ):
-                true_dots.append((dcx, dcy))
-
-        # 直接在原始 raw_roi 上擷取四周完全空白隔離的水平扁平保持音短橫槓 (-)（圓滑線弧頂因與長弧相連自動被排除！）
-        tenuto_bars: List[Tuple[float, float]] = []
-        num_raw, _, rstats, rcent = cv2.connectedComponentsWithStats(raw_roi)
-        for rlbl in range(1, num_raw):
-            tw = int(rstats[rlbl, cv2.CC_STAT_WIDTH])
-            th = int(rstats[rlbl, cv2.CC_STAT_HEIGHT])
-            ta = int(rstats[rlbl, cv2.CC_STAT_AREA])
-            if (
-                sp * 0.65 <= tw <= sp * 1.55
-                and 1 <= th <= max(5, int(round(sp * 0.42)))
-                and (tw / max(1.0, float(th))) >= 2.3
-                and (ta / max(1.0, float(tw * th))) >= 0.68
-            ):
-                tenuto_bars.append((float(xl) + float(rcent[rlbl][0]), float(rcent[rlbl][1])))
-
+        # 8. 為每顆音符計算連槓數、附點與演奏記號（延長記號 𝄐 / 保持音 - / 跳音 .）
         for note in merged:
             if note.is_grace:
                 note.beam_count = 2
@@ -1611,8 +1720,10 @@ class ScoreAnalyzer:
                 for dx, dy in true_dots
             )
 
-            # 演奏記號判定：符頭正上方或正下方的「保持音 (-)」或「跳音 (.)」
-            if any(
+            # 演奏記號判定：優先檢查「延長記號 (𝄐)」，其次檢查「保持音 (-)」與「跳音 (.)」
+            if any(abs(note.x - fcx) <= sp * 1.10 for _, _, _, _, fcx in fermata_zones):
+                note.articulation = "延長記號 (𝄐)"
+            elif any(
                 abs(tx - note.x) <= sp * 0.58 and (sp * 0.62 <= abs(ty - note.y) <= sp * 2.35)
                 for tx, ty in tenuto_bars
             ):

@@ -1321,7 +1321,7 @@ class AutoScrollPage(QWidget):
                 beats_per_sec = max(0.2, (self._bpm / 60.0) * self._scroll_speed)
                 if "跳音" in ev.articulation:
                     gate = 0.48
-                elif "保持音" in ev.articulation:
+                elif "保持音" in ev.articulation or "延長記號" in ev.articulation:
                     gate = 0.99
                 else:
                     gate = 0.92

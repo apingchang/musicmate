@@ -437,6 +437,66 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertEqual(m3_notes[1].midi_note, 80)
         self.assertEqual(m3_notes[1].accidental, 1)
 
+    def test_fermata_hollow_half_note_and_volta_anti_shift(self):
+        """驗證五線譜上方有反覆括號與延長記號 (Fermata 𝄐) 時：五線譜不偏移、延長記號不誤判為 C6，且空心二分音符 (F4 / A4) 與延音正確辨識"""
+        img = np.full((340, 1100, 3), 255, dtype=np.uint8)
+        sp = 14
+        sy = 150
+        for i in range(5):
+            cv2.line(img, (60, sy + i * sp), (1040, sy + i * sp), (25, 25, 25), 2)
+        y_top, y_bot = sy, sy + 4 * sp
+
+        # 在五線譜上方 1*sp 處繪製長反覆跳房子括號 (1. ┌────────┐)，測試五線譜不會被吸上去偏移 1 線！
+        cv2.line(img, (120, sy - sp), (320, sy - sp), (25, 25, 25), 2)
+        cv2.line(img, (120, sy - sp), (120, sy - 3), (25, 25, 25), 2)
+
+        # 小節線：M1 (F4 二分音符 + 延長記號 𝄐), M2 (A4 二分音符 + 延長記號 𝄐 + 終止雙小節線)
+        cv2.line(img, (560, y_top), (560, y_bot), (25, 25, 25), 2)
+        cv2.line(img, (1032, y_top), (1032, y_bot), (20, 20, 20), 2)
+        cv2.rectangle(img, (1037, y_top), (1042, y_bot), (20, 20, 20), -1)
+
+        def draw_hollow_half_with_fermata(nx: int, ny: int):
+            # 空心橢圓符頭 + 右側朝上符幹
+            cv2.ellipse(img, (nx, ny), (9, 6), -20, 0, 360, (15, 15, 15), -1)
+            cv2.ellipse(img, (nx, ny), (5, 3), -20, 0, 360, (255, 255, 255), -1)
+            cv2.line(img, (nx + 8, ny - int(3.3 * sp)), (nx + 8, ny), (15, 15, 15), 2)
+            # 五線譜正上方繪製延長記號 Fermata (𝄐：內凹彎弧 + 中央圓點)
+            fy = sy - int(1.9 * sp)
+            cv2.ellipse(img, (nx + 2, fy + 10), (17, 12), 0, 190, 350, (15, 15, 15), 3)
+            cv2.circle(img, (nx + 2, fy + 8), 3, (15, 15, 15), -1)
+
+        # M1: 第一間 F4 (y = y_bot - 0.5*sp, MIDI 65) + Fermata
+        draw_hollow_half_with_fermata(420, int(y_bot - 0.5 * sp))
+        # M2: 第二間 A4 (y = y_bot - 1.5*sp, MIDI 69) + Fermata
+        draw_hollow_half_with_fermata(820, int(y_bot - 1.5 * sp))
+
+        res = self.analyzer.analyze_pages([img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        st0 = res.pages[0].staves[0]
+        # 驗證五線譜上下界精準對齊 y=150..206，絕未上移 1 個間距
+        self.assertAlmostEqual(st0.y_top_norm * 340.0, float(y_top), delta=2.5)
+        self.assertAlmostEqual(st0.y_bot_norm * 340.0, float(y_bot), delta=2.5)
+
+        self.assertEqual(len(st0.measures[0].notes), 1)
+        ev_f4 = st0.measures[0].notes[0]
+        self.assertEqual(ev_f4.note_name, "F4")
+        self.assertEqual(ev_f4.midi_note, 65)
+        self.assertTrue(ev_f4.is_hollow)
+        self.assertEqual(ev_f4.articulation, "延長記號 (𝄐)")
+        self.assertIn("二分音符 (1/2)", ev_f4.note_type)
+        self.assertIn("延長記號 (𝄐)", ev_f4.note_type)
+        self.assertAlmostEqual(ev_f4.duration_beats, 3.5, places=2)
+
+        self.assertEqual(len(st0.measures[1].notes), 1)
+        ev_a4 = st0.measures[1].notes[0]
+        self.assertEqual(ev_a4.note_name, "A4")
+        self.assertEqual(ev_a4.midi_note, 69)
+        self.assertTrue(ev_a4.is_hollow)
+        self.assertEqual(ev_a4.articulation, "延長記號 (𝄐)")
+        self.assertIn("二分音符 (1/2)", ev_a4.note_type)
+        self.assertIn("延長記號 (𝄐)", ev_a4.note_type)
+        self.assertAlmostEqual(ev_a4.duration_beats, 3.5, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()
