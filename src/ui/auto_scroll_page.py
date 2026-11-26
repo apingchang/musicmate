@@ -758,6 +758,32 @@ class AutoScrollPage(QWidget):
             # 2. 執行尺度不變 OpenCV OMR 結構分析
             self._run_score_analysis()
 
+            # 2b. 若樂譜上辨識到明確拍號（如 2/4）與速度標記（如 ♩ = 116），自動同步設定至工具列！
+            auto_meta_tags = []
+            if self._analysis:
+                det_ts = self._analysis.detected_time_sig
+                if det_ts and det_ts in self.TIME_SIGNATURES:
+                    new_beats = self.TIME_SIGNATURES[det_ts]
+                    self.time_sig_combo.blockSignals(True)
+                    self.time_sig_combo.setCurrentText(det_ts)
+                    self.time_sig_combo.blockSignals(False)
+                    if abs(new_beats - self._beats_per_measure) > 1e-6:
+                        self._beats_per_measure = new_beats
+                        self._analyzer.rebuild_timeline(
+                            self._analysis,
+                            beats_per_measure=self._beats_per_measure,
+                            enable_repeats=self._enable_repeats,
+                        )
+                    auto_meta_tags.append(f"拍號 {det_ts}")
+
+                det_bpm = self._analysis.detected_bpm
+                if det_bpm and 30 <= det_bpm <= 260:
+                    self._bpm = det_bpm
+                    self.bpm_spin.blockSignals(True)
+                    self.bpm_spin.setValue(det_bpm)
+                    self.bpm_spin.blockSignals(False)
+                    auto_meta_tags.append(f"速度 {det_bpm} BPM")
+
             # 3. 預設自適應寬度呈現並顯示初始游標與第一音符校準資訊
             self._fit_to_width()
 
@@ -768,10 +794,11 @@ class AutoScrollPage(QWidget):
                 rep_info = ""
                 if self._analysis.repeat_sections:
                     sec_str = ", ".join(f"M{s}~M{e}" for s, e in self._analysis.repeat_sections)
-                    rep_info = f"、反覆區段 ||: {sec_str} :||"
+                    rep_info = f"、反覆 ||: {sec_str} :||"
+                meta_info = f"、自動套用 {' / '.join(auto_meta_tags)}" if auto_meta_tags else ""
                 self.status_text.setText(
                     f"已載入：{file_name}（{self._page_count} 頁 | 偵測到 {n_staves} 行五線譜、"
-                    f"共 {self._analysis.total_measures} 小節{rep_info}、{n_events} 個演奏事件）"
+                    f"共 {self._analysis.total_measures} 小節{rep_info}{meta_info}、{n_events} 個演奏事件）"
                 )
                 self._sync_playhead_visual(scroll_to_staff=False)
             else:
@@ -1287,12 +1314,18 @@ class AutoScrollPage(QWidget):
                 f"時長：{ev.duration_beats:.2f} 拍 (橫槓={ev.beam_count}){rep_detail}"
             )
 
-        # 連續播放中進入新音符時發聲
+        # 連續播放中進入新音符時發聲（依保持音 / 跳音記號微調發聲長度比例）
         if self._is_playing and idx != self._last_played_event_idx:
             self._last_played_event_idx = idx
             if not ev.is_rest and ev.midi_note > 0:
                 beats_per_sec = max(0.2, (self._bpm / 60.0) * self._scroll_speed)
-                dur_sec = max(0.09, (ev.duration_beats / beats_per_sec) * 0.95)
+                if "跳音" in ev.articulation:
+                    gate = 0.48
+                elif "保持音" in ev.articulation:
+                    gate = 0.99
+                else:
+                    gate = 0.92
+                dur_sec = max(0.08, (ev.duration_beats / beats_per_sec) * gate)
                 self._synth.play_note(ev.midi_note, duration_sec=dur_sec)
             else:
                 self._synth.stop_all()

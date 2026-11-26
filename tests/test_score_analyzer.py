@@ -333,6 +333,110 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         page._on_play_toggle()
         self.assertFalse(page._is_playing)
 
+    def test_auto_time_sig_bpm_accidentals_dots_and_tenuto(self):
+        """驗證 6 項校準功能：自動拍號 (2/4)、自動速度 (♩=116)、保持音橫槓不誤判附點、加線附點八分音符、降記號 Bb5 與升記號 G#5"""
+        img = np.full((360, 1250, 3), 255, dtype=np.uint8)
+        sp = 12
+        sy = 160
+        for i in range(5):
+            cv2.line(img, (60, sy + i * sp), (1190, sy + i * sp), (25, 25, 25), 2)
+        y_top, y_bot = sy, sy + 4 * sp
+
+        # 譜頭上方速度標記：(♩ = 116)
+        cv2.putText(img, "Allegro (", (110, sy - 38), cv2.FONT_HERSHEY_TRIPLEX, 0.62, (20, 20, 20), 1)
+        cv2.ellipse(img, (238, sy - 42), (5, 4), -20, 0, 360, (20, 20, 20), -1)
+        cv2.line(img, (242, sy - 64), (242, sy - 42), (20, 20, 20), 2)
+        cv2.rectangle(img, (254, sy - 49), (266, sy - 47), (20, 20, 20), -1)
+        cv2.rectangle(img, (254, sy - 43), (266, sy - 41), (20, 20, 20), -1)
+        cv2.putText(img, "116)", (276, sy - 38), cv2.FONT_HERSHEY_TRIPLEX, 0.62, (20, 20, 20), 2)
+
+        # 譜號 + 2/4 拍號
+        cv2.ellipse(img, (86, sy + 2 * sp), (9, 30), 8, 0, 360, (20, 20, 20), 2)
+        cv2.line(img, (87, sy - 16), (87, y_bot + 16), (20, 20, 20), 2)
+        cv2.putText(img, "2", (120, sy + 2 * sp - 1), cv2.FONT_HERSHEY_TRIPLEX, 0.72, (20, 20, 20), 2)
+        cv2.putText(img, "4", (120, y_bot - 1), cv2.FONT_HERSHEY_TRIPLEX, 0.72, (20, 20, 20), 2)
+
+        # 小節線：M1(保持音四分音符 E5), M2(加線附點八分音符 A5. + 十六分 E5), M3(降記號 Bb5 + 升記號 G#5)
+        for bx in (420, 780, 1190):
+            cv2.line(img, (bx, y_top), (bx, y_bot), (25, 25, 25), 2)
+
+        # M1: E5 四分音符 (第四間 y = sy + 0.5*sp) + 正上方保持音短橫槓 (-)
+        e5_x, e5_y = 270, int(sy + 0.5 * sp)
+        cv2.ellipse(img, (e5_x, e5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (e5_x - 7, e5_y), (e5_x - 7, e5_y + 3 * sp), (15, 15, 15), 2)
+        cv2.rectangle(img, (e5_x - 6, sy - 8), (e5_x + 6, sy - 6), (15, 15, 15), -1)
+
+        # M2: 上加一線 A5 (y = sy - sp) 附點八分音符 + E5 十六分音符（共用主橫槓 + 右側短雙槓）
+        a5_x, a5_y = 530, sy - sp
+        cv2.line(img, (a5_x - 12, a5_y), (a5_x + 12, a5_y), (25, 25, 25), 2)  # 加線
+        cv2.ellipse(img, (a5_x, a5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.circle(img, (a5_x + 14, a5_y - 4), 3, (15, 15, 15), -1)  # 右上間附點
+        cv2.line(img, (a5_x - 7, a5_y), (a5_x - 7, a5_y + 3 * sp + 6), (15, 15, 15), 2)
+
+        n2_x, n2_y = 630, int(sy + 0.5 * sp)
+        cv2.ellipse(img, (n2_x, n2_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (n2_x - 7, n2_y), (n2_x - 7, a5_y + 3 * sp + 6), (15, 15, 15), 2)
+        cv2.rectangle(img, (a5_x - 7, a5_y + 3 * sp + 3), (n2_x - 6, a5_y + 3 * sp + 8), (15, 15, 15), -1)
+
+        # M3: 降 B5 (Bb5, y = sy - 1.5*sp, MIDI 82) 與 升 G5 (G#5, y = sy - 0.5*sp, MIDI 80)
+        bb_x, bb_y = 910, int(sy - 1.5 * sp)
+        cv2.line(img, (bb_x - 16, sy - sp), (bb_x + 12, sy - sp), (25, 25, 25), 2)
+        # 繪製降記號 ♭（左側朝上長幹 + 右下圓肚，下方無延伸）
+        fx = bb_x - 19
+        cv2.line(img, (fx, bb_y - 16), (fx, bb_y + 5), (15, 15, 15), 2)
+        cv2.ellipse(img, (fx + 4, bb_y + 1), (4, 5), 0, -90, 90, (15, 15, 15), 2)
+        cv2.ellipse(img, (bb_x, bb_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (bb_x - 7, bb_y), (bb_x - 7, bb_y + 3 * sp), (15, 15, 15), 2)
+
+        gs_x, gs_y = 1070, int(sy - 0.5 * sp)
+        # 繪製升記號 ♯（雙直幹貫穿上下 + 雙斜橫槓）
+        sx_l, sx_r = gs_x - 21, gs_x - 15
+        cv2.line(img, (sx_l, gs_y - 14), (sx_l, gs_y + 14), (15, 15, 15), 2)
+        cv2.line(img, (sx_r, gs_y - 15), (sx_r, gs_y + 13), (15, 15, 15), 2)
+        cv2.line(img, (sx_l - 2, gs_y - 4), (sx_r + 2, gs_y - 6), (15, 15, 15), 3)
+        cv2.line(img, (sx_l - 2, gs_y + 5), (sx_r + 2, gs_y + 3), (15, 15, 15), 3)
+        cv2.ellipse(img, (gs_x, gs_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (gs_x - 7, gs_y), (gs_x - 7, gs_y + 3 * sp), (15, 15, 15), 2)
+
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        self.temp_files.append(path)
+
+        page = AutoScrollPage()
+        page.sound_btn.setChecked(False)
+        # 初始為預設 4/4 與 100 BPM，驗證 load_file 後自動切換為 2/4 與 116 BPM
+        self.assertEqual(page.time_sig_combo.currentText(), "4/4")
+        self.assertEqual(page.bpm_spin.value(), 100)
+        self.assertTrue(page.load_file(path))
+
+        self.assertEqual(page._analysis.detected_time_sig, "2/4")
+        self.assertEqual(page.time_sig_combo.currentText(), "2/4")
+        self.assertEqual(page._analysis.detected_bpm, 116)
+        self.assertEqual(page.bpm_spin.value(), 116)
+
+        st0 = page._analysis.pages[0].staves[0]
+        m1_ev = st0.measures[0].notes[0]
+        self.assertEqual(m1_ev.note_name, "E5")
+        self.assertFalse(m1_ev.is_dotted)
+        self.assertEqual(m1_ev.articulation, "保持音 (-)")
+        self.assertIn("四分音符 (1/4)", m1_ev.note_type)
+        self.assertIn("保持音 (-)", m1_ev.note_type)
+
+        m2_ev0 = st0.measures[1].notes[0]
+        self.assertEqual(m2_ev0.note_name, "A5")
+        self.assertTrue(m2_ev0.is_dotted)
+        self.assertIn("附點八分音符", m2_ev0.note_type)
+
+        m3_notes = st0.measures[2].notes
+        self.assertEqual(len(m3_notes), 2)
+        self.assertEqual(m3_notes[0].note_name, "Bb5")
+        self.assertEqual(m3_notes[0].midi_note, 82)
+        self.assertEqual(m3_notes[0].accidental, -1)
+        self.assertEqual(m3_notes[1].note_name, "G#5")
+        self.assertEqual(m3_notes[1].midi_note, 80)
+        self.assertEqual(m3_notes[1].accidental, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
