@@ -497,6 +497,76 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertIn("延長記號 (𝄐)", ev_a4.note_type)
         self.assertAlmostEqual(ev_a4.duration_beats, 3.5, places=2)
 
+    def test_curved_book_staff_flagged_eighth_and_dense_16ths(self):
+        """驗證書頁右半彎曲 + 漸弱記號 > 下：M5 的 C5/D5 不偏不漏，且右半 M17 帶彎勾八分音符與 M18 皆精準維持 G5（不誤判為 (C5) 或 B5）"""
+        w, h = 1300, 320
+        flat = np.full((h, w, 3), 255, dtype=np.uint8)
+        sp = 14
+        sy = 130
+        for i in range(5):
+            cv2.line(flat, (60, sy + i * sp), (1240, sy + i * sp), (25, 25, 25), 2)
+        y_top, y_bot = sy, sy + 4 * sp
+
+        # 小節線：M1 (密集 C5-C5-D5-C5-E5) | M2 (♮G5, G5 四分, 帶彎勾 G5 八分) | M3 (G5, G5 + 下方漸弱記號 >)
+        for bx in (560, 940, 1240):
+            cv2.line(flat, (bx, y_top), (bx, y_bot), (25, 25, 25), 2)
+
+        # M1: C5(1/8) - C5(1/16) - D5(1/16) - C5(1/8) - E5(1/8)
+        c5_y = int(y_bot - 2.5 * sp)
+        d5_y = int(y_bot - 3.0 * sp)
+        e5_y = int(y_bot - 3.5 * sp)
+        m1_pts = [(220, c5_y), (268, c5_y), (294, d5_y), (322, c5_y), (375, e5_y)]
+        beam_y = y_bot + sp
+        for nx, ny in m1_pts:
+            cv2.ellipse(flat, (nx, ny), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+            cv2.line(flat, (nx - 7, ny), (nx - 7, beam_y), (15, 15, 15), 2)
+        cv2.rectangle(flat, (213, beam_y - 4), (295, beam_y), (15, 15, 15), -1)
+        cv2.rectangle(flat, (261, beam_y - 11), (295, beam_y - 7), (15, 15, 15), -1)
+        cv2.rectangle(flat, (315, beam_y - 4), (369, beam_y), (15, 15, 15), -1)
+
+        # M2: G5 四分音符 + 帶右側弧形符尾彎勾的單顆 G5 八分音符（驗證不漏檢且彎勾不變成 (C5)！）
+        g5_y = int(y_top - 0.5 * sp)
+        cv2.ellipse(flat, (680, g5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(flat, (673, g5_y), (673, g5_y + 3 * sp + 4), (15, 15, 15), 2)
+
+        fx_n = 830
+        cv2.ellipse(flat, (fx_n, g5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(flat, (fx_n - 7, g5_y), (fx_n - 7, g5_y + int(3.4 * sp)), (15, 15, 15), 2)
+        # 繪製朝上彎回的八分音符符尾勾
+        pts_flag = np.array(
+            [[fx_n - 7, g5_y + int(3.4 * sp)], [fx_n + 4, g5_y + int(2.6 * sp)], [fx_n + 7, g5_y + int(1.6 * sp)]],
+            dtype=np.int32,
+        )
+        cv2.polylines(flat, [pts_flag], False, (15, 15, 15), 3)
+
+        # M3: 兩顆 G5 四分音符 + 五線譜下方 1*sp 處長漸弱記號 >
+        for nx in (1030, 1140):
+            cv2.ellipse(flat, (nx, g5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+            cv2.line(flat, (nx - 7, g5_y), (nx - 7, g5_y + 3 * sp + 4), (15, 15, 15), 2)
+        cv2.line(flat, (990, y_bot + sp - 3), (1190, y_bot + sp + 3), (20, 20, 20), 2)
+        cv2.line(flat, (990, y_bot + sp + 9), (1190, y_bot + sp + 3), (20, 20, 20), 2)
+
+        # 模擬真實書頁右半明顯上彎（左半平緩、右半上翹 18px > 1.2*sp！）
+        x_grid = np.arange(w, dtype=np.float32)[None, :]
+        y_grid = np.arange(h, dtype=np.float32)[:, None]
+        curve_shift = 18.0 * np.clip((x_grid - w * 0.40) / (w * 0.60), 0.0, 1.0) ** 1.6
+        curved_img = cv2.remap(
+            flat,
+            np.broadcast_to(x_grid, (h, w)),
+            y_grid + curve_shift,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+
+        res = self.analyzer.analyze_pages([curved_img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        st0 = res.pages[0].staves[0]
+        self.assertEqual([n.note_name for n in st0.measures[0].notes], ["C5", "C5", "D5", "C5", "E5"])
+        self.assertEqual([n.note_name for n in st0.measures[1].notes], ["G5", "G5"])
+        self.assertIn("八分音符", st0.measures[1].notes[1].note_type)
+        self.assertEqual([n.note_name for n in st0.measures[2].notes], ["G5", "G5"])
+
 
 if __name__ == "__main__":
     unittest.main()

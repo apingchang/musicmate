@@ -371,9 +371,9 @@ class ScoreAnalyzer:
         if orig_h < 80 or orig_w < 100:
             return PageAnalysis(page_index, orig_w, orig_h, 0.0), start_beat, start_measure_num, start_event_idx
 
-        # 1. 自適應標準化分析寬度（橫向截圖約 1300px，直向整頁 A4 自動放大至最高 1750px 確保譜線間距充足）
+        # 1. 自適應標準化分析寬度（橫向截圖約 1300px，直向整頁 A4 多行樂譜自動提升至最高 2150px 確保密集十六分音符間距充足）
         aspect_hw = orig_h / max(1.0, float(orig_w))
-        target_w = int(np.clip(self.BASE_WIDTH * max(1.0, aspect_hw * 0.92), 1300, 1750))
+        target_w = int(np.clip(self.BASE_WIDTH * max(1.0, aspect_hw * 1.15), 1300, 2150))
         if abs(orig_w - target_w) > 60:
             scale = target_w / float(orig_w)
             w = target_w
@@ -833,48 +833,99 @@ class ScoreAnalyzer:
         hlen = max(12, w // 70)
         band_horiz = cv2.morphologyEx(band_bin, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (hlen, 1)))
 
-        # 第一階段：全寬度垂直切變搜尋此行五線譜的真實獨立斜率 (5條全寬長線產生最高投影銳利度，不受短橫槓干擾)
+        # 第一階段：直接以分片追蹤點 (tx_trk, ty_trk) 建構真實書頁彎曲/傾斜基準曲線，再做微幅斜率精調（徹底解決右半書頁彎曲偏移 1 線問題！）
         sw_small = min(w, 650)
         small_h_mat = cv2.resize(band_horiz.astype(np.float32), (sw_small, bh), interpolation=cv2.INTER_AREA)
+        xs_small_px = np.linspace(0.0, float(w - 1), sw_small, dtype=np.float64)
         xs_norm = np.linspace(-0.5, 0.5, sw_small, dtype=np.float32)
 
-        def eval_slope_sharpness(dy_total: float) -> float:
-            shifts = np.round(dy_total * xs_norm).astype(np.int32)
-            r_idx = np.arange(bh, dtype=np.int32)[:, None] + shifts[None, :]
-            valid_m = (r_idx >= 0) & (r_idx < bh)
-            warped = small_h_mat[np.clip(r_idx, 0, bh - 1), np.arange(sw_small)[None, :]] * valid_m
-            proj = np.sum(warped, axis=1)
-            return float(np.sum(np.diff(proj) ** 2))
-
-        # 以分片追蹤點對的 Theil-Sen 中位數斜率作為穩健初值，在 ±1.2° 範圍內精搜全寬最佳斜率（完全免疫漸強弱記號 < > 干擾）
         tx_trk = np.array([c[0] for c in track], dtype=np.float64)
         ty_trk = np.array([0.5 * (c[1] + c[2]) for c in track], dtype=np.float64)
-        pair_slopes = []
-        for i_p in range(len(tx_trk)):
-            for j_p in range(i_p + 1, len(tx_trk)):
-                if tx_trk[j_p] - tx_trk[i_p] >= w * 0.15:
-                    pair_slopes.append((ty_trk[j_p] - ty_trk[i_p]) / (tx_trk[j_p] - tx_trk[i_p]))
-        init_dy = float(np.median(pair_slopes) * w) if pair_slopes else 0.0
-
-        search_span = w * math.tan(math.radians(1.5))
-        dy_lo = min(init_dy - search_span, -search_span * 0.8)
-        dy_hi = max(init_dy + search_span, search_span * 0.8)
-        best_dy = init_dy
-        best_score = -1.0
-        for dy_cand in np.linspace(dy_lo, dy_hi, 37):
-            sc = eval_slope_sharpness(float(dy_cand))
-            if sc > best_score:
-                best_score = sc
-                best_dy = float(dy_cand)
-
-        for dy_cand in np.linspace(best_dy - search_span / 12.0, best_dy + search_span / 12.0, 17):
-            sc = eval_slope_sharpness(float(dy_cand))
-            if sc > best_score:
-                best_score = sc
-                best_dy = float(dy_cand)
-
         x_all = np.arange(w, dtype=np.float64)
-        linear_offset = best_dy * ((x_all - w / 2.0) / max(1.0, float(w)))
+
+        if len(tx_trk) >= 4 and (tx_trk[-1] - tx_trk[0]) >= w * 0.32:
+            # 二階多項式離群值剔除，保留平滑書頁曲線並排除單片雜訊
+            if len(tx_trk) >= 5:
+                poly2 = np.polyfit(tx_trk, ty_trk, deg=2)
+                resid = np.abs(ty_trk - np.polyval(poly2, tx_trk))
+                keep_m = resid <= max(2.5, sp_est * 0.48)
+                if int(np.sum(keep_m)) >= 4:
+                    tx_trk = tx_trk[keep_m]
+                    ty_trk = ty_trk[keep_m]
+
+            raw_curve = np.interp(x_all, tx_trk, ty_trk)
+            k_l = min(2, len(tx_trk) - 1)
+            sl_l = float(np.clip((ty_trk[k_l] - ty_trk[0]) / max(1.0, tx_trk[k_l] - tx_trk[0]), -0.12, 0.12))
+            sl_r = float(np.clip((ty_trk[-1] - ty_trk[-1 - k_l]) / max(1.0, tx_trk[-1] - tx_trk[-1 - k_l]), -0.12, 0.12))
+            left_m = x_all < tx_trk[0]
+            right_m = x_all > tx_trk[-1]
+            if np.any(left_m):
+                raw_curve[left_m] = ty_trk[0] + sl_l * (x_all[left_m] - tx_trk[0])
+            if np.any(right_m):
+                raw_curve[right_m] = ty_trk[-1] + sl_r * (x_all[right_m] - tx_trk[-1])
+
+            g_win = max(31, (int(w // 10) | 1))
+            pad_g = g_win
+            left_pad = raw_curve[0] + sl_l * np.arange(-pad_g, 0, dtype=np.float64)
+            right_pad = raw_curve[-1] + sl_r * np.arange(1, pad_g + 1, dtype=np.float64)
+            padded_curve = np.concatenate([left_pad, raw_curve, right_pad]).astype(np.float32)
+            raw_curve = cv2.GaussianBlur(
+                padded_curve.reshape(1, -1), (g_win, 1), 0
+            ).ravel()[pad_g:pad_g + w].astype(np.float64)
+            init_offset_full = raw_curve - float(np.mean(raw_curve))
+            init_offset_small = np.interp(xs_small_px, x_all, init_offset_full).astype(np.float32)
+
+            def eval_curve_sharpness(delta_dy: float) -> float:
+                shifts = np.round(init_offset_small + delta_dy * xs_norm).astype(np.int32)
+                r_idx = np.arange(bh, dtype=np.int32)[:, None] + shifts[None, :]
+                valid_m = (r_idx >= 0) & (r_idx < bh)
+                warped = small_h_mat[np.clip(r_idx, 0, bh - 1), np.arange(sw_small)[None, :]] * valid_m
+                proj = np.sum(warped, axis=1)
+                return float(np.sum(np.diff(proj) ** 2))
+
+            fine_span = w * math.tan(math.radians(0.45))
+            best_delta_dy = 0.0
+            best_score = -1.0
+            for d_cand in np.linspace(-fine_span, fine_span, 19):
+                sc = eval_curve_sharpness(float(d_cand))
+                if sc > best_score:
+                    best_score = sc
+                    best_delta_dy = float(d_cand)
+            linear_offset = init_offset_full + best_delta_dy * ((x_all - w / 2.0) / max(1.0, float(w)))
+        else:
+            def eval_slope_sharpness(dy_total: float) -> float:
+                shifts = np.round(dy_total * xs_norm).astype(np.int32)
+                r_idx = np.arange(bh, dtype=np.int32)[:, None] + shifts[None, :]
+                valid_m = (r_idx >= 0) & (r_idx < bh)
+                warped = small_h_mat[np.clip(r_idx, 0, bh - 1), np.arange(sw_small)[None, :]] * valid_m
+                proj = np.sum(warped, axis=1)
+                return float(np.sum(np.diff(proj) ** 2))
+
+            pair_slopes = []
+            for i_p in range(len(tx_trk)):
+                for j_p in range(i_p + 1, len(tx_trk)):
+                    if tx_trk[j_p] - tx_trk[i_p] >= w * 0.15:
+                        pair_slopes.append((ty_trk[j_p] - ty_trk[i_p]) / (tx_trk[j_p] - tx_trk[i_p]))
+            init_dy = float(np.median(pair_slopes) * w) if pair_slopes else 0.0
+
+            search_span = w * math.tan(math.radians(1.5))
+            dy_lo = min(init_dy - search_span, -search_span * 0.8)
+            dy_hi = max(init_dy + search_span, search_span * 0.8)
+            best_dy = init_dy
+            best_score = -1.0
+            for dy_cand in np.linspace(dy_lo, dy_hi, 37):
+                sc = eval_slope_sharpness(float(dy_cand))
+                if sc > best_score:
+                    best_score = sc
+                    best_dy = float(dy_cand)
+
+            for dy_cand in np.linspace(best_dy - search_span / 12.0, best_dy + search_span / 12.0, 17):
+                sc = eval_slope_sharpness(float(dy_cand))
+                if sc > best_score:
+                    best_score = sc
+                    best_dy = float(dy_cand)
+
+            linear_offset = best_dy * ((x_all - w / 2.0) / max(1.0, float(w)))
 
         pad = int(round(sp_est * 3.8))
         shifts_full = np.round(linear_offset).astype(np.int32)
@@ -1325,6 +1376,10 @@ class ScoreAnalyzer:
         nh_mask = cv2.morphologyEx(roi_clean, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (nh_w, nh_h)))
 
         num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(nh_mask)
+        all_blob_pts = [
+            (float(centroids[i][0]), float(centroids[i][1]), int(stats[i, cv2.CC_STAT_AREA]))
+            for i in range(1, num_labels)
+        ]
         candidates: List[_RawNote] = []
         short_hooks: List[Tuple[float, float]] = []
 
@@ -1344,33 +1399,66 @@ class ScoreAnalyzer:
             aspect = cw / max(1.0, float(ch))
             area_ratio = area / max(1.0, sp * sp)
 
-            # 若臨時升降號橫槓與右側符頭水平微觸連成寬區塊 (如 #G5 / bB5, cw ≈ 1.78..3.45*sp)，自動切出右側獨立主符頭！
+            # 寬區塊切分 (cw > 1.92*sp 且左右雙峰之間存在真實鞍部凹陷)：相容「[升降號 + 符頭]」與「[相鄰雙符頭微觸]」，絕不誤切單顆寬橢圓符頭！
             if (
-                (sp * 1.78 < cw <= sp * 3.45)
+                (sp * 1.92 < cw <= sp * 3.55)
                 and (sp * 0.36 <= ch <= sp * 1.85)
                 and ((sy1 - sp * 2.5) <= cy <= (sy2 + sp * 2.5))
             ):
-                sub_w = min(cw - 4, max(6, int(round(sp * 1.35))))
-                sub_x0 = nx + cw - sub_w
-                sub_patch = nh_mask[ny:ny + ch, sub_x0:nx + cw]
-                sy_idx, sx_idx = np.where(sub_patch > 0)
-                if len(sx_idx) > 0:
-                    sub_ch = int(sy_idx.max() - sy_idx.min() + 1)
-                    sub_ar = float(len(sx_idx)) / max(1.0, sp * sp)
-                    sub_cx = float(sub_x0) + float(np.mean(sx_idx))
-                    sub_cy = float(ny) + float(np.mean(sy_idx))
-                    if (sp * 0.36 <= sub_ch <= sp * 1.65) and sub_ar >= 0.55 and sub_cx >= header_skip:
-                        candidates.append(
-                            _RawNote(
-                                x=xl + sub_cx,
-                                y=sub_cy,
-                                width=float(sub_w),
-                                area_ratio=max(0.95, sub_ar),
-                                is_grace=False,
-                                is_hollow=False,
+                col_hs_w = np.sum(nh_mask[ny:ny + ch, nx:nx + cw] > 0, axis=0)
+                mid_l = max(2, int(cw * 0.25))
+                mid_r = max(mid_l + 1, int(cw * 0.75))
+                neck_idx = mid_l + int(np.argmin(col_hs_w[mid_l:mid_r]))
+                neck_h = int(col_hs_w[neck_idx])
+                l_peak = int(np.max(col_hs_w[:neck_idx])) if neck_idx > 0 else 0
+                r_peak = int(np.max(col_hs_w[neck_idx + 1:])) if neck_idx + 1 < cw else 0
+                has_saddle = (
+                    l_peak >= max(4, int(sp * 0.42))
+                    and r_peak >= max(4, int(sp * 0.42))
+                    and neck_h <= int(min(l_peak, r_peak) * 0.82)
+                )
+                if cw >= sp * 2.35 or has_saddle:
+                    sub_w_r = min(cw - 4, max(6, int(round(sp * 1.32))))
+                    sub_x0_r = nx + cw - sub_w_r
+                    sub_patch_r = nh_mask[ny:ny + ch, sub_x0_r:nx + cw]
+                    sy_r, sx_r = np.where(sub_patch_r > 0)
+                    if len(sx_r) > 0:
+                        sub_ch_r = int(sy_r.max() - sy_r.min() + 1)
+                        sub_ar_r = float(len(sx_r)) / max(1.0, sp * sp)
+                        sub_cx_r = float(sub_x0_r) + float(np.mean(sx_r))
+                        sub_cy_r = float(ny) + float(np.mean(sy_r))
+                        if (sp * 0.36 <= sub_ch_r <= sp * 1.65) and sub_ar_r >= 0.55 and sub_cx_r >= header_skip:
+                            candidates.append(
+                                _RawNote(
+                                    x=xl + sub_cx_r,
+                                    y=sub_cy_r,
+                                    width=float(sub_w_r),
+                                    area_ratio=max(0.95, sub_ar_r),
+                                    is_grace=False,
+                                    is_hollow=False,
+                                )
                             )
-                        )
-                continue
+                    sub_w_l = min(sub_x0_r - nx + 2, max(6, int(round(sp * 1.32))))
+                    if sub_w_l >= int(round(sp * 0.75)):
+                        sub_patch_l = nh_mask[ny:ny + ch, nx:nx + sub_w_l]
+                        sy_l, sx_l = np.where(sub_patch_l > 0)
+                        if len(sx_l) > 0:
+                            sub_ch_l = int(sy_l.max() - sy_l.min() + 1)
+                            sub_ar_l = float(len(sx_l)) / max(1.0, sp * sp)
+                            sub_cx_l = float(nx) + float(np.mean(sx_l))
+                            sub_cy_l = float(ny) + float(np.mean(sy_l))
+                            if (sp * 0.36 <= sub_ch_l <= sp * 1.65) and sub_ar_l >= 0.52 and sub_cx_l >= header_skip:
+                                candidates.append(
+                                    _RawNote(
+                                        x=xl + sub_cx_l,
+                                        y=sub_cy_l,
+                                        width=float(sub_w_l),
+                                        area_ratio=max(0.55, sub_ar_l),
+                                        is_grace=True,
+                                        is_hollow=False,
+                                    )
+                                )
+                    continue
 
             if not (
                 (sp * 0.36 <= ch <= sp * 1.58)
@@ -1382,35 +1470,72 @@ class ScoreAnalyzer:
                 continue
 
             sx0, sx1 = max(0, nx - 2), min(roi.shape[1], nx + cw + 2)
+            # 排除全譜高垂直小節線在譜線交點處殘留的窄小方塊 (cw < 0.78*sp 且位於貫穿五線譜之直線上)
+            if cw < sp * 0.78:
+                iy_s1, iy_s2 = max(0, int(round(sy1))), min(roi.shape[0], int(round(sy2)) + 1)
+                if iy_s2 > iy_s1 + 6 and sx1 > sx0:
+                    bar_span = int(np.max(np.sum(v_stems[iy_s1:iy_s2, sx0:sx1] > 0, axis=0)))
+                    if bar_span >= int((iy_s2 - iy_s1) * 0.78):
+                        continue
+
             sy0, sy1_p = max(0, ny - int(sp * 0.50)), min(roi.shape[0], ny + ch + int(sp * 0.50))
             stem_cols = np.where(np.sum(pure_stems[sy0:sy1_p, sx0:sx1] > 0, axis=0) >= 3)[0]
             min_stem_gap = max(5, int(round(sp * 0.65)))
             n_stems = (1 + int(np.sum(np.diff(stem_cols) > min_stem_gap))) if len(stem_cols) > 0 else 0
 
-            if n_stems >= 2 and (cw >= sp * 1.15 or area_ratio < 0.68):
-                horiz_bars.append(
-                    _HorizBar(
-                        x1=float(xl + nx),
-                        x2=float(xl + nx + cw),
-                        y_center=cy,
-                        width=float(cw),
-                        height=float(ch),
-                        in_staff_mid=False,
-                    )
+            # 僅在「細扁殘條 (area_ratio < 0.62)」或「位於譜外且下方確實串接 >=2 顆較小倚音符頭的雙倚音短連槓 (如 M4)」時視為 horiz_bar，絕不誤刪帶彎勾八分音符 (如 M17 G5) 或緊鄰十六分音符 (如 M5 D5)！
+            if n_stems >= 2:
+                sub_grace_xs = [
+                    bx_o for bx_o, by_o, ba_o in all_blob_pts
+                    if (nx - 4) <= bx_o <= (nx + cw + 4)
+                    and sp * 0.75 <= abs(by_o - cy) <= sp * 2.95
+                    and ba_o < area * 0.88
+                ]
+                is_grace_minibeam = (
+                    (cy < sy1 - sp * 0.25 or cy > sy2 + sp * 0.25)
+                    and len(sub_grace_xs) >= 2
+                    and (max(sub_grace_xs) - min(sub_grace_xs)) >= sp * 0.50
                 )
-                continue
+                if area_ratio < 0.62 or is_grace_minibeam:
+                    horiz_bars.append(
+                        _HorizBar(
+                            x1=float(xl + nx),
+                            x2=float(xl + nx + cw),
+                            y_center=cy,
+                            width=float(cw),
+                            height=float(ch),
+                            in_staff_mid=False,
+                        )
+                    )
+                    continue
 
             is_grace_cand = (area_ratio < 0.72) or (cw < sp * 1.06 and n_stems >= 1)
             if is_grace_cand and n_stems == 0:
                 continue
 
-            # 位於五線譜上下界之外的真實實心音符必有符幹（排除無符幹之延長記號弧頂、圓滑線弧頂或文字殘影誤判為高音符頭！）
-            if (cy < sy1 - sp * 0.58 or cy > sy2 + sp * 0.58) and n_stems == 0:
-                sy_ext0 = max(0, ny - int(sp * 1.6))
-                sy_ext1 = min(roi.shape[0], ny + ch + int(sp * 1.6))
-                ext_stem = int(np.max(np.sum(pure_stems[sy_ext0:sy_ext1, sx0:sx1] > 0, axis=0))) if sx1 > sx0 else 0
-                if ext_stem < 4:
+            # 位於五線譜上下界之外的真實實心音符必有緊貼自身的長符幹（低於底線之音符符幹必朝上進入五線譜，排除漸強弱記號尖端 > 與延長記號！）
+            if cy > sy2 + sp * 0.58:
+                sx_low0, sx_low1 = max(0, nx - 1), min(roi.shape[1], nx + cw + 1)
+                up_low = pure_stems[max(0, ny - int(sp * 2.5)):min(roi.shape[0], ny + 3), sx_low0:sx_low1]
+                if up_low.size == 0 or int(np.max(np.sum(up_low > 0, axis=0))) < max(7, int(sp * 1.05)):
                     continue
+            elif cy < sy1 - sp * 0.58 and n_stems == 0:
+                sx_hi0, sx_hi1 = max(0, nx - 1), min(roi.shape[1], nx + cw + 1)
+                sy_ext0 = max(0, ny - int(sp * 1.8))
+                sy_ext1 = min(roi.shape[0], ny + ch + int(sp * 1.8))
+                ext_stem = int(np.max(np.sum(pure_stems[sy_ext0:sy_ext1, sx_hi0:sx_hi1] > 0, axis=0))) if sx_hi1 > sx_hi0 else 0
+                if ext_stem < max(7, int(sp * 1.05)):
+                    continue
+
+            # 以符頭核心厚實直欄（排除邊緣 1~2px 符幹與譜線十字交點殘刺）計算精準垂直中心 core_cy，避免 C5 被交點往下拉成 B4！
+            blob_p = nh_mask[ny:ny + ch, nx:nx + cw] > 0
+            col_hs = np.sum(blob_p, axis=0)
+            max_ch = int(np.max(col_hs)) if col_hs.size > 0 else 0
+            if max_ch >= 4:
+                core_cols = col_hs >= max(2, int(round(max_ch * 0.52)))
+                cy_ys, _ = np.where(blob_p[:, core_cols])
+                if len(cy_ys) > 0:
+                    cy = float(ny) + float(np.mean(cy_ys))
 
             candidates.append(
                 _RawNote(
@@ -1429,6 +1554,11 @@ class ScoreAnalyzer:
         filtered_cands: List[_RawNote] = []
         for c in candidates:
             if c.area_ratio < 0.90:
+                if c.area_ratio < 0.48 and any(
+                    abs(c.x - m.x) <= sp * 0.85 and abs(c.y - m.y) < sp * 1.55
+                    for m in main_cands
+                ):
+                    continue
                 attached_main = [
                     m for m in main_cands
                     if abs(c.x - m.x) <= sp * 1.35 and abs(c.y - m.y) >= sp * 1.50
@@ -1564,11 +1694,21 @@ class ScoreAnalyzer:
         main_notes_list = [n for n in merged if not n.is_grace]
         accidental_kill_zones: List[Tuple[float, float]] = []
 
+        iy_bar1, iy_bar2 = max(0, int(round(sy1))), min(roi.shape[0], int(round(sy2)) + 1)
+        bar_cols_roi = (
+            np.where(np.sum(v_stems[iy_bar1:iy_bar2, :] > 0, axis=0) >= int((iy_bar2 - iy_bar1) * 0.92))[0]
+            if iy_bar2 > iy_bar1 + 8 else np.array([], dtype=np.int64)
+        )
+
         for m_idx, mn in enumerate(main_notes_list):
             ax_right = int(round(mn.x - max(mn.width * 0.56, sp * 0.86)))
             ax_left = max(int(round(header_end_x)), int(round(mn.x - sp * 2.22)))
             if m_idx > 0:
                 ax_left = max(ax_left, int(round(main_notes_list[m_idx - 1].x + sp * 0.72)))
+            if len(bar_cols_roi) > 0:
+                bars_in_span = bar_cols_roi[(xl + bar_cols_roi >= ax_left - 2) & (xl + bar_cols_roi <= ax_right)]
+                if len(bars_in_span) > 0:
+                    ax_left = max(ax_left, int(xl + bars_in_span[-1] + 3))
             if ax_right - ax_left < int(sp * 0.50):
                 continue
 
@@ -1636,9 +1776,9 @@ class ScoreAnalyzer:
                 )
             ]
 
-        # 7c. 清除升降號殘片後，將「無朝上符幹、僅有朝下符幹連接下方主連槓」之偏小十六分主音符（如 M5 的 D5）還原為一般主音符！
+        # 7c. 清除升降號殘片後，將連接主連槓之偏小十六分主音符（如 M5 的 D5）還原為一般主音符！
         for n in merged:
-            if n.is_grace and n.area_ratio >= 0.40:
+            if n.is_grace and n.area_ratio >= 0.52 and n.width >= sp * 0.80:
                 rx_c = int(round(n.x - xl))
                 sx0_g = max(0, rx_c - int(sp * 0.65))
                 sx1_g = min(roi.shape[1], rx_c + int(sp * 0.65))
@@ -1648,7 +1788,13 @@ class ScoreAnalyzer:
                     hb.n_stems >= 2 and (hb.x1 - sp * 0.6 <= n.x <= hb.x2 + sp * 0.6) and hb.y_center > n.y + sp * 0.9
                     for hb in horiz_bars
                 )
-                if up_s < int(sp * 0.7) and dn_s >= int(sp * 1.1) and has_lower_main_beam:
+                has_upper_main_beam = any(
+                    hb.n_stems >= 2 and hb.width >= sp * 2.35 and (hb.x1 - sp * 0.6 <= n.x <= hb.x2 + sp * 0.6) and hb.y_center < n.y - sp * 0.9
+                    for hb in horiz_bars
+                )
+                if (up_s < int(sp * 0.7) and dn_s >= int(sp * 1.1) and has_lower_main_beam) or (
+                    dn_s < int(sp * 0.7) and up_s >= int(sp * 1.1) and has_upper_main_beam
+                ):
                     n.is_grace = False
 
         # 8. 為每顆音符計算連槓數、附點與演奏記號（延長記號 𝄐 / 保持音 - / 跳音 .）
@@ -1708,6 +1854,43 @@ class ScoreAnalyzer:
                             if r_h >= 2:
                                 side_cnt += 2 if r_h >= sp * 1.12 else 1
                         distinct_beams = max(distinct_beams, side_cnt)
+
+                # 若尚未計入連槓或粗短勾，檢查獨立符幹末端右側是否有細弧形八分音符符尾勾 (Flag，無論朝上或朝下符幹，符尾勾必向符幹右側延伸！)
+                if distinct_beams == 0:
+                    rx_f = int(round(note.x - xl))
+                    sx_f0 = max(0, rx_f - int(round(sp * 0.75)))
+                    sx_f1 = min(roi.shape[1], rx_f + int(round(sp * 0.75)))
+                    if sx_f1 > sx_f0:
+                        dn_band = pure_stems[min(roi.shape[0] - 1, int(round(note.y + sp * 0.4))):min(roi.shape[0], int(round(note.y + sp * 3.8))), sx_f0:sx_f1]
+                        up_band = pure_stems[max(0, int(round(note.y - sp * 3.8))):max(1, int(round(note.y - sp * 0.4))), sx_f0:sx_f1]
+                        dn_col_sums = np.sum(dn_band > 0, axis=0) if dn_band.size > 0 else np.zeros(1)
+                        up_col_sums = np.sum(up_band > 0, axis=0) if up_band.size > 0 else np.zeros(1)
+                        if int(np.max(dn_col_sums)) >= int(sp * 1.6):
+                            st_x = sx_f0 + int(np.argmax(dn_col_sums))
+                            ys_st = np.where(pure_stems[int(round(note.y + sp * 0.4)):min(roi.shape[0], int(round(note.y + sp * 3.8))), st_x] > 0)[0]
+                            if len(ys_st) > 0:
+                                y_tip = int(round(note.y + sp * 0.4)) + int(ys_st[-1])
+                                fy0 = max(int(round(note.y + sp * 0.9)), y_tip - int(round(sp * 1.65)))
+                                fy1 = min(roi.shape[0], y_tip + 3)
+                                fx0 = min(roi.shape[1], st_x + 3)
+                                fx1 = min(roi.shape[1], st_x + int(round(sp * 1.15)))
+                                if fy1 > fy0 and fx1 > fx0:
+                                    f_patch = roi_clean[fy0:fy1, fx0:fx1] > 0
+                                    if int(np.sum(f_patch)) >= max(6, int(sp * sp * 0.14)) and int(np.sum(np.any(f_patch, axis=0))) >= max(3, int(sp * 0.30)):
+                                        distinct_beams = 1
+                        elif int(np.max(up_col_sums)) >= int(sp * 1.6):
+                            st_x = sx_f0 + int(np.argmax(up_col_sums))
+                            ys_st = np.where(pure_stems[max(0, int(round(note.y - sp * 3.8))):max(1, int(round(note.y - sp * 0.4))), st_x] > 0)[0]
+                            if len(ys_st) > 0:
+                                y_tip = max(0, int(round(note.y - sp * 3.8))) + int(ys_st[0])
+                                fy0 = max(0, y_tip - 2)
+                                fy1 = min(int(round(note.y - sp * 0.9)), y_tip + int(round(sp * 1.65)))
+                                fx0 = min(roi.shape[1], st_x + 3)
+                                fx1 = min(roi.shape[1], st_x + int(round(sp * 1.15)))
+                                if fy1 > fy0 and fx1 > fx0:
+                                    f_patch = roi_clean[fy0:fy1, fx0:fx1] > 0
+                                    if int(np.sum(f_patch)) >= max(6, int(sp * sp * 0.14)) and int(np.sum(np.any(f_patch, axis=0))) >= max(3, int(sp * 0.30)):
+                                        distinct_beams = 1
 
                 note.beam_count = min(3, distinct_beams)
 
