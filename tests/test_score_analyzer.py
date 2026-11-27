@@ -752,5 +752,36 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
             self.assertLessEqual(int(np.max(np.abs(w_pcm))), int(32767 * 0.65))
 
 
+    def test_top_line_note_stem_not_barline_double_beam_on_line4(self):
+        """驗證 OMR v12.1：頂線 F5 長符幹貫穿全譜不被當小節線，雙連槓壓在第 4 線上時不得殘留假 G4（M41/M43/M45）"""
+        w, h = 1500, 260
+        img = np.full((h, w, 3), 255, dtype=np.uint8)
+        sp = 15
+        y_top = 100
+        y_bot = y_top + 4 * sp
+        staff_r = 1280
+        for i in range(5):
+            y = y_top + i * sp
+            cv2.line(img, (60, y), (staff_r, y), (25, 25, 25), 2)
+        cv2.ellipse(img, (95, y_top + 2 * sp), (14, 24), 0, 0, 360, (25, 25, 25), 3)
+        cv2.line(img, (95, y_top - 18), (95, y_bot + 18), (25, 25, 25), 3)
+        for bx in (520, staff_r):
+            cv2.line(img, (bx, y_top), (bx, y_bot), (25, 25, 25), 2)
+
+        e5_y = int(y_top + 0.5 * sp)
+        f5_y = y_top
+        y3 = y_top + 3 * sp
+        for nx, ny in ((300, e5_y), (380, f5_y)):
+            cv2.ellipse(img, (nx, ny), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+            cv2.line(img, (nx - 7, ny), (nx - 7, y_bot + 2), (15, 15, 15), 2)
+        cv2.rectangle(img, (293, y3 - 5), (374, y3 + 5), (15, 15, 15), -1)
+        cv2.rectangle(img, (293, y_bot - 3), (374, y_bot + 3), (15, 15, 15), -1)
+
+        res = self.analyzer.analyze_pages([img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        notes = [n.note_name for m in res.pages[0].staves[0].measures for n in m.notes if not n.is_rest]
+        self.assertEqual(notes, ["E5", "F5"])
+
+
 if __name__ == "__main__":
     unittest.main()

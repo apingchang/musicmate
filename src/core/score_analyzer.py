@@ -1305,13 +1305,16 @@ class ScoreAnalyzer:
             sx_pad = max(4, int(round(sp * 0.35)))
             sx0, sx1 = max(0, bx - sx_pad), min(roi.shape[1], bx + bw + sx_pad)
             sy0, sy1_b = max(0, by - int(sp * 0.8)), min(roi.shape[0], by + bh + int(sp * 0.8))
-            b_scols = np.where(np.sum(pure_stems_no_bars[sy0:sy1_b, sx0:sx1] > 0, axis=0) >= 3)[0]
-            b_nstems = (1 + int(np.sum(np.diff(b_scols) > min_beam_stem_gap))) if len(b_scols) > 0 else 0
             in_mid = (sy1 + sp * 1.15) <= cy <= (sy2 - sp * 1.15)
             bar_col_hs = np.sum((blabels[by:by + bh, bx:bx + bw] == lbl), axis=0)
             p35_bar_h = float(np.percentile(bar_col_hs, 35)) if bar_col_hs.size > 0 else 0.0
             min_line_d = min(abs(cy - (sy1 + k_s * sp)) for k_s in range(5))
-            touches_barline = len(bar_cols_roi) > 0 and bool(np.any((bar_cols_roi >= bx - 3) & (bar_cols_roi <= bx + bw + 3)))
+            # 僅「偏薄 (疑似偏粗譜線)」候選才排除小節線直欄；真實厚連槓 (如雙十六分連槓) 的端點符幹一律保留（頂線音符長符幹貫穿全譜會被誤判為小節線，不可因此丟連槓！）
+            is_thin_bar = p35_bar_h <= max(float(max_thin + 2), sp * 0.38)
+            stem_src = pure_stems_no_bars if is_thin_bar else pure_stems
+            b_scols = np.where(np.sum(stem_src[sy0:sy1_b, sx0:sx1] > 0, axis=0) >= 3)[0]
+            b_nstems = (1 + int(np.sum(np.diff(b_scols) > min_beam_stem_gap))) if len(b_scols) > 0 else 0
+            touches_barline = is_thin_bar and len(bar_cols_roi) > 0 and bool(np.any((bar_cols_roi >= bx - 3) & (bar_cols_roi <= bx + bw + 3)))
             # 排除局部偏粗五線譜線（如 M47 行尾偏粗第 3 線直抵終止線或被上下符幹同時貫穿）：絕不誤傷 M13/M16 等單側符幹匯聚的真實連槓！
             if min_line_d <= sp * 0.25 and p35_bar_h <= max(float(max_thin + 2), sp * 0.38):
                 up_band_b = pure_stems_no_bars[max(0, by - int(sp * 1.1)):max(1, by - 1), sx0:sx1]
