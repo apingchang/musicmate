@@ -10,9 +10,9 @@ project_root = Path('.').resolve()
 
 datas = []
 
-# 若未來有 resources 或 assets 目錄，可加入 datas
-# if (project_root / "assets").exists():
-#     datas.append(('assets', 'assets'))
+# 打包內建真實樂器 SoundFont 音色庫等資源目錄
+if (project_root / "assets").exists():
+    datas.append(('assets', 'assets'))
 
 hidden_imports = [
     'PyQt6',
@@ -27,6 +27,8 @@ hidden_imports = [
     'mido',
     'pygame',
     'music21',
+    'tinysoundfont',
+    '_tinysoundfont',
 ]
 
 a = Analysis(

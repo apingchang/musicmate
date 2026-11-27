@@ -504,9 +504,13 @@ class AutoScrollPage(QWidget):
         row1.addWidget(self.sound_btn)
 
         self.timbre_combo = QComboBox()
-        self.timbre_combo.addItems(["鋼琴", "薩克斯風", "長笛"])
-        self.timbre_combo.setMinimumWidth(82)
+        self.timbre_combo.addItems(list(NoteSynthesizer.TIMBRES.keys()))
+        self.timbre_combo.setMinimumWidth(96)
         self.timbre_combo.setMinimumHeight(26)
+        self.timbre_combo.setMaxVisibleItems(18)
+        self.timbre_combo.setToolTip(
+            f"選擇真實樂器音色 ({self._synth.soundfont_name})"
+        )
         self.timbre_combo.currentTextChanged.connect(self._on_timbre_change)
         row1.addWidget(self.timbre_combo)
 

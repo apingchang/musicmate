@@ -166,9 +166,12 @@ class Metronome:
                 if _audio_backend == "pygame":
                     try:
                         import pygame
-                        # 轉換為 16-bit 有號整數 PCM
+                        # 轉換為 16-bit 有號整數 PCM，並自動相容立體聲 / 單聲道 mixer
                         pcm16 = (raw_wave * 32767).astype(np.int16)
-                        snd = pygame.sndarray.make_sound(pcm16)
+                        init_info = pygame.mixer.get_init()
+                        if init_info and init_info[2] == 2 and pcm16.ndim == 1:
+                            pcm16 = np.column_stack((pcm16, pcm16))
+                        snd = pygame.sndarray.make_sound(np.ascontiguousarray(pcm16))
                         self._sound_cache[(sound_idx, is_accent)] = snd
                     except Exception:
                         self._sound_cache[(sound_idx, is_accent)] = raw_wave

@@ -77,12 +77,21 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
     def test_note_synthesizer_wave_generation(self):
         synth = NoteSynthesizer()
         self.assertAlmostEqual(synth.midi_to_freq(69), 440.0, places=2)
-        for timbre in ("鋼琴", "薩克斯風", "長笛"):
+        self.assertTrue(synth.using_soundfont)
+        expected_instruments = [
+            "鋼琴", "薩克斯風", "長笛", "豎笛", "雙簧管", "低音管",
+            "小提琴", "大提琴", "低音提琴", "小號", "法國號", "管風琴",
+            "馬林巴", "定音鼓", "三角鐵", "小鼓", "大鼓",
+        ]
+        for timbre in expected_instruments:
+            self.assertIn(timbre, NoteSynthesizer.TIMBRES)
             synth.timbre = timbre
             pcm = synth.synthesize_wave(60, 0.25)
             self.assertEqual(pcm.dtype, np.int16)
-            self.assertGreater(len(pcm), 4000)
-            self.assertGreater(int(np.max(np.abs(pcm))), 1000)
+            self.assertEqual(pcm.ndim, 2)
+            self.assertEqual(pcm.shape[1], 2)
+            self.assertGreater(pcm.shape[0], 10000)
+            self.assertGreater(int(np.max(np.abs(pcm))), 2000)
 
     def test_multi_measure_rest_detection(self):
         """驗證五線譜中央粗橫條 + 上方數字能正確辨識為休止 2 小節"""

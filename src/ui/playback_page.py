@@ -71,10 +71,9 @@ class PlaybackPage(QWidget):
         # 音色選擇
         timbre_layout = QHBoxLayout()
         timbre_layout.addWidget(QLabel("音色："))
+        from src.core.note_synth import NoteSynthesizer
         self.timbre_combo = QComboBox()
-        self.timbre_combo.addItems(
-            ["鋼琴", "吉他", "小提琴", "長笛", "豎笛", "小喇叭"]
-        )
+        self.timbre_combo.addItems(list(NoteSynthesizer.TIMBRES.keys()))
         timbre_layout.addWidget(self.timbre_combo)
         timbre_layout.addStretch()
         layout.addLayout(timbre_layout)

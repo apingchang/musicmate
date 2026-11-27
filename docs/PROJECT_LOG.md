@@ -316,6 +316,15 @@
   - 預先建立排除貫穿全譜小節線的 `pure_stems_no_bars` 供符幹計數使用，並於 `_analyze_single_page` 過濾緊貼小節線 `±0.85*sp` 內的假倚音，徹底消除 `M51/M52` 分隔線處誤出現 `(F5)` 的問題。
 - 新增 `test_grace_minibeam_interbeam_hollow_sharp_and_barline_slur` 單元測試，全部 16 項測試通過
 
+#### 真實樂器 SoundFont (`.sf2`) 立體聲合成引擎升級（17 種交響／管弦／打擊樂器）
+- **整合 `TinySoundFont` + 免費開源音色庫 `GeneralUser GS v1.471`（`assets/soundfonts/GeneralUser-GS.sf2`, 29.8 MB）**（`src/core/note_synth.py`、`musicmate.spec`）：
+  - 零外部系統驅動依賴（免安裝 `FluidSynth`），跨 Linux 與 Windows 皆可隨 PyInstaller 單一執行檔開箱即用，並相容開發環境與凍結打包（`sys._MEIPASS`）自動尋址。
+  - 支援真實立體聲取樣渲染（`44.1kHz Stereo 16-bit PCM`）、自然放鍵尾音殘響（acoustic release tail）、低音樂器自動音域映射（低音管／大提琴／低音提琴／定音鼓）與各樂器音量均衡正規化，同時保留無音色庫時之 NumPy 備援合成。
+- **全面支援 17 種真實取樣樂器並同步更新 UI 選單**（`src/ui/auto_scroll_page.py`、`src/ui/playback_page.py`、`src/core/metronome.py`）：
+  - 鋼琴（Stereo Grand）、薩克斯風（Alto Sax）、長笛（Flute）、豎笛（Clarinet）、雙簧管（Oboe）、低音管（Bassoon）、小提琴（Violin）、大提琴（Cello）、低音提琴（Double Bass）、小號（Trumpet）、法國號（French Horns）、管風琴（Pipe Organ）、馬林巴（Marimba）、定音鼓（Timpani）、三角鐵（Triangle）、小鼓（Acoustic Snare）、大鼓（Bass Drum）。
+  - 節拍器（`metronome.py`）同步升級立體聲 `pygame.mixer` 相容處理。
+- 更新 `test_note_synthesizer_wave_generation` 驗證全部 17 種 SoundFont 真實樂器立體聲渲染，全部 16 項單元測試通過
+
 ---
 
 *本文件由夥計維護，記錄所有專案相關討論。*
