@@ -567,6 +567,105 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertIn("八分音符", st0.measures[1].notes[1].note_type)
         self.assertEqual([n.note_name for n in st0.measures[2].notes], ["G5", "G5"])
 
+    def test_grace_minibeam_interbeam_hollow_sharp_and_barline_slur(self):
+        """驗證 OMR v9 五項精修：雙倚音短連槓不誤判 G5、16 分雙連槓白縫不誤判空心音、譜線上斜線倚音補救、#G4 不誤拆 F4+G4、小節線圓滑線交叉不誤判 (F5)"""
+        w, h = 1520, 260
+        img = np.full((h, w, 3), 255, dtype=np.uint8)
+        sp = 15
+        y_top = 100
+        y_bot = y_top + 4 * sp
+        for i in range(5):
+            y = y_top + i * sp
+            cv2.line(img, (40, y), (w - 40, y), (25, 25, 25), 2)
+        # 左側高音譜號區域
+        cv2.ellipse(img, (75, y_top + 2 * sp), (14, 24), 0, 0, 360, (25, 25, 25), 3)
+        cv2.line(img, (75, y_top - 18), (75, y_bot + 18), (25, 25, 25), 3)
+
+        # 5 個小節分隔線
+        for bx in (420, 680, 940, 1220, 1460):
+            cv2.line(img, (bx, y_top), (bx, y_bot), (25, 25, 25), 2)
+
+        # M1: 雙倚音 (C5)-(D5) 附上方雙連槓 + 主音 E5（驗證不誤判 G5 且保留雙倚音）
+        c5_y = int(y_bot - 2.5 * sp)
+        d5_y = int(y_bot - 3.0 * sp)
+        e5_y = int(y_bot - 3.5 * sp)
+        cv2.ellipse(img, (215, c5_y), (5, 4), -18, 0, 360, (15, 15, 15), -1)
+        cv2.ellipse(img, (238, d5_y), (5, 4), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (219, c5_y), (219, y_top - 4), (15, 15, 15), 2)
+        cv2.line(img, (242, d5_y), (242, y_top - 4), (15, 15, 15), 2)
+        cv2.rectangle(img, (219, y_top - 7), (243, y_top - 3), (15, 15, 15), -1)
+        cv2.rectangle(img, (219, y_top - 1), (243, y_top + 2), (15, 15, 15), -1)
+        cv2.ellipse(img, (285, e5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (277, e5_y), (277, y_bot + 8), (15, 15, 15), 2)
+
+        # M2: 兩顆 16 分音符 G5 + F5（下方平行雙連槓間留白縫，驗證絕不誤生第 3 顆空心音符！）
+        g5_y = int(y_top - 0.5 * sp)
+        f5_y = y_top
+        b1_y = y_top + int(2.7 * sp)
+        b2_y = b1_y + 8
+        for nx, ny in ((515, g5_y), (575, f5_y)):
+            cv2.ellipse(img, (nx, ny), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+            cv2.line(img, (nx - 7, ny), (nx - 7, b2_y), (15, 15, 15), 2)
+        cv2.rectangle(img, (508, b1_y - 3), (569, b1_y + 1), (15, 15, 15), -1)
+        cv2.rectangle(img, (508, b2_y - 2), (569, b2_y + 2), (15, 15, 15), -1)
+
+        # M3: 開頭小型斜線裝飾音 (F5 譜線上) + 主音 E5（驗證小型斜線倚音能被補救抓出）
+        gx = 745
+        cv2.ellipse(img, (gx, f5_y + 2), (4, 3), -15, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (gx + 4, f5_y + 2), (gx + 4, f5_y - 26), (15, 15, 15), 1)
+        cv2.line(img, (gx + 4, f5_y - 26), (gx + 13, f5_y - 16), (15, 15, 15), 2)
+        cv2.line(img, (gx - 1, f5_y - 12), (gx + 11, f5_y - 22), (15, 15, 15), 2)
+        cv2.ellipse(img, (815, e5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (807, e5_y), (807, y_bot + 8), (15, 15, 15), 2)
+
+        # M4: 大型升記號 ♯ + G4（驗證 ♯ 不誤判為 F4，且 G4 正確升半音為 G#4）+ 跨小節線圓滑線穿過頂線 F5
+        g4_y = int(y_bot - 1.0 * sp)
+        sx = 1088
+        cv2.line(img, (sx - 4, g4_y - 22), (sx - 4, g4_y + 21), (15, 15, 15), 2)
+        cv2.line(img, (sx + 4, g4_y - 23), (sx + 4, g4_y + 20), (15, 15, 15), 2)
+        cv2.line(img, (sx - 9, g4_y - 4), (sx + 9, g4_y - 7), (15, 15, 15), 4)
+        cv2.line(img, (sx - 9, g4_y + 6), (sx + 9, g4_y + 3), (15, 15, 15), 4)
+        cv2.ellipse(img, (1112, g4_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (1119, g4_y), (1119, g4_y - 3 * sp), (15, 15, 15), 2)
+        # 在 M4/M5 小節線 (x=1220) 頂端 F5 處畫一道跨線圓滑線弧
+        cv2.ellipse(img, (1216, y_top + 22), (34, 24), 0, 210, 330, (15, 15, 15), 2)
+
+        # M5: 單顆 A4 四分音符（驗證小節線處絕不出現假裝飾音 (F5)）
+        a4_y = int(y_bot - 1.5 * sp)
+        cv2.ellipse(img, (1330, a4_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (1337, a4_y), (1337, a4_y - 3 * sp), (15, 15, 15), 2)
+
+        res = self.analyzer.analyze_pages([img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        st0 = res.pages[0].staves[0]
+        self.assertGreaterEqual(len(st0.measures), 5)
+
+        # 1. M1: (C5), (D5), E5 — 不可有假 G5，雙倚音皆須保留
+        m1_notes = st0.measures[0].notes
+        self.assertEqual([n.note_name for n in m1_notes], ["(C5)", "(D5)", "E5"])
+        self.assertTrue(m1_notes[0].is_grace and m1_notes[1].is_grace and not m1_notes[2].is_grace)
+
+        # 2. M2: 僅 2 顆音 (G5, F5)，絕不可把雙連槓白縫誤判為第 3 顆空心音符
+        m2_notes = st0.measures[1].notes
+        self.assertEqual(len(m2_notes), 2)
+        self.assertEqual([n.note_name for n in m2_notes], ["G5", "F5"])
+
+        # 3. M3: 開頭小型斜線裝飾音必被抓出，後接主音 E5
+        m3_notes = st0.measures[2].notes
+        self.assertEqual(len(m3_notes), 2)
+        self.assertTrue(m3_notes[0].is_grace)
+        self.assertEqual(m3_notes[1].note_name, "E5")
+
+        # 4. M4: 僅 1 顆 G#4 (MIDI 68)，升記號絕不可誤判為 F4
+        m4_notes = st0.measures[3].notes
+        self.assertEqual(len(m4_notes), 1)
+        self.assertEqual(m4_notes[0].note_name, "G#4")
+        self.assertEqual(m4_notes[0].midi_note, 68)
+
+        # 5. M5: 僅 1 顆 A4，小節線圓滑線交叉處絕不可誤判為 (F5)
+        m5_notes = st0.measures[4].notes
+        self.assertEqual([n.note_name for n in m5_notes], ["A4"])
+
 
 if __name__ == "__main__":
     unittest.main()
