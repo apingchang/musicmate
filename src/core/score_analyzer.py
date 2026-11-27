@@ -1608,15 +1608,37 @@ class ScoreAnalyzer:
                     )
                     continue
 
+            restored_cy = False
             is_grace_cand = (area_ratio < 0.72) or (cw < sp * 1.06 and n_stems >= 1)
-            # 若符頭寬度充足 (cw >= 1.05*sp, area_ratio >= 0.56) 且帶有標準長下垂符幹（倚音符幹一律朝上，絕無長下垂單幹），必為一般主音符（如 M21 E5）！
-            if is_grace_cand and cw >= sp * 1.05 and area_ratio >= 0.56:
-                dn_check = pure_stems_no_bars[min(roi.shape[0] - 1, ny + ch - 2):min(roi.shape[0], ny + ch + int(sp * 2.8)), max(0, nx - 2):min(roi.shape[1], nx + int(cw * 0.55) + 2)]
+            # 若符頭帶有左側標準長下垂符幹（倚音符幹一律朝上，絕無長下垂單幹），且寬度充足或連通至下方八分/十六分主連槓（如 M21 E5、M47 行尾被譜線削薄的 B4），必為一般主音符！
+            if is_grace_cand:
+                dn_x0 = max(0, nx - max(3, int(round(sp * 0.58))))
+                dn_x1 = min(roi.shape[1], nx + int(cw * 0.55) + 2)
+                dn_check = pure_stems_no_bars[min(roi.shape[0] - 1, ny + ch - 2):min(roi.shape[0], ny + ch + int(sp * 2.8)), dn_x0:dn_x1]
                 up_check = pure_stems_no_bars[max(0, ny - int(sp * 2.2)):max(1, ny + 2), max(0, nx - 2):min(roi.shape[1], nx + cw + 2)]
                 dn_len = int(np.max(np.sum(dn_check > 0, axis=0))) if dn_check.size > 0 else 0
                 up_len = int(np.max(np.sum(up_check > 0, axis=0))) if up_check.size > 0 else 0
-                if dn_len >= int(sp * 1.65) and up_len < int(sp * 0.55):
+                conn_lower_beam = any(
+                    hb.n_stems >= 2 and (hb.x1 - sp * 0.85) <= abs_cx <= (hb.x2 + sp * 0.95) and hb.y_center > cy + sp * 0.85
+                    for hb in horiz_bars
+                )
+                if dn_len >= int(sp * 1.45) and up_len < int(sp * 0.55) and (
+                    (cw >= sp * 1.05 and area_ratio >= 0.56)
+                    or (conn_lower_beam and cw >= sp * 0.55)
+                    or (dn_len >= int(sp * 1.50) and cw >= sp * 0.62 and area_ratio >= 0.24)
+                ):
                     is_grace_cand = False
+                    area_ratio = max(area_ratio, 0.95)
+                    # 若騎線符頭下半月牙被 nh_mask 削去導致 ch 偏扁，由 vert_keep 上下極值中點還原完整橢圓垂直中心（確保 M47 B4 100% 對齊第 3 線！）
+                    if ch < sp * 0.65:
+                        rc_y0 = max(0, ny - 2)
+                        rc_y1 = min(roi.shape[0], ny + ch + max(4, int(round(sp * 0.55))))
+                        vk_sub = cv2.subtract(vert_keep[rc_y0:rc_y1, max(0, nx - 2):min(roi.shape[1], nx + cw + 1)], pure_stems[rc_y0:rc_y1, max(0, nx - 2):min(roi.shape[1], nx + cw + 1)])
+                        rc_ys, _ = np.where(vk_sub > 0)
+                        if len(rc_ys) >= 4:
+                            cy = float(rc_y0) + 0.5 * (float(rc_ys.min()) + float(rc_ys.max()))
+                            ch = max(ch, int(rc_ys.max() - rc_ys.min() + 1))
+                            restored_cy = True
             if is_grace_cand and n_stems == 0:
                 # 若該小符頭正上方/正下方已有雙倚音短連槓（如 M4/M28 較高的 (D5) 倚音，其符幹較短 < 1.25*sp），仍須保留！
                 under_grace_beam = any(
@@ -1665,14 +1687,15 @@ class ScoreAnalyzer:
                     continue
 
             # 以符頭核心厚實直欄（排除邊緣 1~2px 符幹與譜線十字交點殘刺）計算精準垂直中心 core_cy，避免 C5 被交點往下拉成 B4！
-            blob_p = nh_mask[ny:ny + ch, nx:nx + cw] > 0
-            col_hs = np.sum(blob_p, axis=0)
-            max_ch = int(np.max(col_hs)) if col_hs.size > 0 else 0
-            if max_ch >= 4:
-                core_cols = col_hs >= max(2, int(round(max_ch * 0.52)))
-                cy_ys, _ = np.where(blob_p[:, core_cols])
-                if len(cy_ys) > 0:
-                    cy = float(ny) + float(np.mean(cy_ys))
+            if not restored_cy:
+                blob_p = nh_mask[ny:ny + ch, nx:nx + cw] > 0
+                col_hs = np.sum(blob_p, axis=0)
+                max_ch = int(np.max(col_hs)) if col_hs.size > 0 else 0
+                if max_ch >= 4:
+                    core_cols = col_hs >= max(2, int(round(max_ch * 0.52)))
+                    cy_ys, _ = np.where(blob_p[:, core_cols])
+                    if len(cy_ys) > 0:
+                        cy = float(ny) + float(np.mean(cy_ys))
 
             candidates.append(
                 _RawNote(
@@ -1833,9 +1856,30 @@ class ScoreAnalyzer:
                         continue
 
                     if all(
-                        not (abs(abs_x - c.x) <= sp * 0.65 and abs(hcy - c.y) <= sp * 0.65 and c.area_ratio >= 0.98)
+                        not (
+                            abs(abs_x - c.x) <= sp * 0.70
+                            and c.area_ratio >= 0.90
+                            and (abs(hcy - c.y) <= sp * 0.85 or hcy < sy1 - sp * 0.35 or hcy > sy2 + sp * 0.35)
+                        )
                         for c in candidates if not c.is_grace
                     ):
+                        # 位於五線譜上下界之外的空心音符（如 A5/C6/C4）必有直接接觸自身邊界的長符幹或加線，徹底排除 M21「圓滑線 + 重音 >」圍成的封閉三角孔誤判為 A5！
+                        if hcy < sy1 - sp * 0.45 or hcy > sy2 + sp * 0.45:
+                            ht_x0 = max(0, int(hx - sp * 0.45))
+                            ht_x1 = min(roi.shape[1], int(hx + hw + sp * 0.45))
+                            ht_touch = pure_stems_no_bars[max(0, hy - 4):min(roi.shape[0], hy + hh + 5), ht_x0:ht_x1]
+                            ht_ext = pure_stems_no_bars[max(0, int(hcy - sp * 2.6)):min(roi.shape[0], int(hcy + sp * 2.6)), ht_x0:ht_x1]
+                            has_real_h_stem = (
+                                ht_touch.size > 0 and int(np.sum(ht_touch > 0)) >= 2
+                                and ht_ext.size > 0 and int(np.max(np.sum(ht_ext > 0, axis=0))) >= int(sp * 1.2)
+                            )
+                            # 若無符幹（如譜外全音符），則左右兩側必有水平加線延伸
+                            ll_y0, ll_y1 = max(0, int(round(hcy)) - 2), min(roi.shape[0], int(round(hcy)) + 3)
+                            ll_l = h_lines_only[ll_y0:ll_y1, max(0, int(hx - sp * 0.55)):max(1, hx)]
+                            ll_r = h_lines_only[ll_y0:ll_y1, min(roi.shape[1] - 1, hx + hw):min(roi.shape[1], int(hx + hw + sp * 0.55))]
+                            has_ledger = (ll_l.size > 0 and np.any(ll_l > 0)) and (ll_r.size > 0 and np.any(ll_r > 0))
+                            if not (has_real_h_stem or has_ledger):
+                                continue
                         # 排除夾在兩條垂直符幹之間的白縫（如雙十六分連槓間距）誤判為空心音符：真實空心音符最多只有單側一根符幹！
                         hl_band = pure_stems[max(0, int(hcy - sp * 2.2)):min(roi.shape[0], int(hcy + sp * 2.2)), max(0, int(hx - sp * 0.45)):max(1, int(hx + 2))]
                         hr_band = pure_stems[max(0, int(hcy - sp * 2.2)):min(roi.shape[0], int(hcy + sp * 2.2)), min(roi.shape[1] - 1, int(hx + hw - 2)):min(roi.shape[1], int(hx + hw + sp * 0.45))]
@@ -1894,6 +1938,12 @@ class ScoreAnalyzer:
                     continue
                 if prev.is_grace and not cand.is_grace:
                     merged[-1] = cand
+                    continue
+                # 實心音符與譜外假空心孔垂直同軸時，一律保留實心音符（絕不讓 [圓滑線+重音>] 空心孔覆寫下方 E5！）
+                if prev.is_hollow and not cand.is_hollow:
+                    merged[-1] = cand
+                    continue
+                if not prev.is_hollow and cand.is_hollow:
                     continue
                 merged[-1] = _RawNote(
                     x=(prev.x + cand.x) / 2.0,

@@ -1,4 +1,4 @@
-"""自動翻譜頁 - 支援 PDF/拍照樂譜載入、OpenCV OMR 音符分析、方案 A 游標、逐小節/逐音符步進校準與即時發聲"""
+"""自動翻譜頁 - 支援 PDF/拍照樂譜載入、OpenCV OMR 音符分析、方案 A 游標、逐音符步進校準與即時發聲"""
 
 import os
 import time
@@ -524,36 +524,9 @@ class AutoScrollPage(QWidget):
 
         tb_vbox.addLayout(row1)
 
-        # === 第二列：逐小節播放、逐音符步進、OMR 標記開關、縮放與換頁 ===
+        # === 第二列：逐音符步進、OMR 標記開關、縮放與換頁 ===
         row2 = QHBoxLayout()
         row2.setSpacing(6)
-
-        # 逐小節控制群組
-        lbl_m = QLabel("逐小節：")
-        lbl_m.setStyleSheet("font-weight: bold; color: #1e40af;")
-        row2.addWidget(lbl_m)
-
-        self.prev_measure_btn = QPushButton("◀ 上一小節")
-        self.prev_measure_btn.setMinimumHeight(26)
-        self.prev_measure_btn.clicked.connect(self._on_prev_measure)
-        row2.addWidget(self.prev_measure_btn)
-
-        self.play_measure_btn = QPushButton("▶ 播本小節")
-        self.play_measure_btn.setMinimumHeight(26)
-        self.play_measure_btn.setStyleSheet(
-            "QPushButton { font-weight: bold; background-color: #dbeafe; color: #1d4ed8; "
-            "border: 1px solid #93c5fd; border-radius: 4px; padding: 2px 10px; }"
-            "QPushButton:hover { background-color: #bfdbfe; }"
-        )
-        self.play_measure_btn.clicked.connect(self._on_play_current_measure)
-        row2.addWidget(self.play_measure_btn)
-
-        self.next_measure_btn = QPushButton("下一小節 ▶")
-        self.next_measure_btn.setMinimumHeight(26)
-        self.next_measure_btn.clicked.connect(self._on_next_measure)
-        row2.addWidget(self.next_measure_btn)
-
-        row2.addSpacing(8)
 
         # 逐音符控制群組
         lbl_n = QLabel("逐音符：")
@@ -666,7 +639,7 @@ class AutoScrollPage(QWidget):
         insp_layout.addWidget(self.measure_label)
 
         self.note_detail_label = QLabel(
-            "🔎 音符校準資訊：尚未載入樂譜（載入後可使用「逐小節」或「逐音符 [ / ]」逐步檢視每個音符的音高、時值與位置）"
+            "🔎 音符校準資訊：尚未載入樂譜（載入後可使用「逐音符 [ / ]」逐步檢視每個音符的音高、時值與位置）"
         )
         self.note_detail_label.setStyleSheet("font-size: 13px; color: #1e293b; font-weight: 500;")
         insp_layout.addWidget(self.note_detail_label, 1)
@@ -689,7 +662,7 @@ class AutoScrollPage(QWidget):
         self.placeholder_label = QLabel(
             "<h3>🎼 尚未載入樂譜</h3>"
             "<p>支援 <b>PDF 樂譜</b> 與 <b>手機拍照圖片 (JPG / PNG / WEBP)</b></p>"
-            "<p>載入後自動偵測五線譜、休止符、小節與音符時值，支援 <b>全曲播放 / 逐小節播放 / 逐音符步進校準</b></p>"
+            "<p>載入後自動偵測五線譜、休止符、小節與音符時值，支援 <b>全曲播放 / 逐音符步進校準</b></p>"
             "<p>點擊上方「<b>📂 開啟樂譜</b>」或直接將檔案<b>拖曳至此處</b></p>"
         )
         self.placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -996,83 +969,6 @@ class AutoScrollPage(QWidget):
         self._scroll_to_top()
         if self._use_note_tracking():
             self._sync_playhead_visual(scroll_to_staff=True)
-
-    # === 逐小節播放與跳轉控制（完整支援反覆記號第 1 遍與第 2 遍序列）===
-    def _get_playback_measures(self) -> List[PlaybackMeasure]:
-        if not self._analysis:
-            return []
-        if self._analysis.playback_measures:
-            return self._analysis.playback_measures
-        # 相容備援
-        res: List[PlaybackMeasure] = []
-        for p in self._analysis.pages:
-            for s in p.staves:
-                for m in s.measures:
-                    res.append(PlaybackMeasure(measure=m, beat_start=m.beat_start, beat_end=m.beat_end))
-        return res
-
-    def _find_current_measure_idx(self, p_measures: List[PlaybackMeasure]) -> int:
-        if not p_measures:
-            return -1
-        for i, pm in enumerate(p_measures):
-            if pm.beat_start - 1e-5 <= self._current_beat < pm.beat_end - 1e-5:
-                return i
-        if self._current_beat >= p_measures[-1].beat_end - 1e-5:
-            return len(p_measures) - 1
-        return 0
-
-    def _on_prev_measure(self):
-        """跳至上一播放小節開頭並試聽第一音"""
-        if not self._use_note_tracking():
-            return
-        self._stop_playing()
-        p_measures = self._get_playback_measures()
-        if not p_measures:
-            return
-        cur_m_idx = self._find_current_measure_idx(p_measures)
-        target_idx = max(0, cur_m_idx - 1)
-        self._jump_to_playback_measure(p_measures[target_idx], preview_sound=True)
-
-    def _on_next_measure(self):
-        """跳至下一播放小節開頭（含反覆跳回第 2 遍）並試聽第一音"""
-        if not self._use_note_tracking():
-            return
-        self._stop_playing()
-        p_measures = self._get_playback_measures()
-        if not p_measures:
-            return
-        cur_m_idx = self._find_current_measure_idx(p_measures)
-        target_idx = min(len(p_measures) - 1, cur_m_idx + 1)
-        self._jump_to_playback_measure(p_measures[target_idx], preview_sound=True)
-
-    def _on_play_current_measure(self):
-        """從當前小節第一拍完整播放完本小節後自動暫停"""
-        if not self._use_note_tracking():
-            return
-        p_measures = self._get_playback_measures()
-        if not p_measures:
-            return
-        cur_m_idx = self._find_current_measure_idx(p_measures)
-        pm = p_measures[cur_m_idx]
-        m = pm.measure
-        self._stop_playing()
-        self._current_beat = pm.beat_start
-        self._stop_at_beat = pm.beat_end
-        pass_tag = f"（🔁 第 {pm.repeat_pass} 遍）" if pm.repeat_pass >= 2 else ""
-        self.status_text.setText(f"正在單獨播放第 {m.measure_number} 小節{pass_tag}（播畢自動暫停）...")
-        self._start_playing()
-        self._stop_at_beat = pm.beat_end
-
-    def _jump_to_playback_measure(self, pm: PlaybackMeasure, preview_sound: bool = True):
-        m = pm.measure
-        self._current_beat = pm.beat_start + 1e-4
-        self._sync_playhead_visual(scroll_to_staff=True)
-        if preview_sound and m.notes:
-            first_ev = m.notes[0]
-            if not first_ev.is_rest and first_ev.midi_note > 0:
-                self._synth.play_note(first_ev.midi_note, duration_sec=0.30)
-        pass_tag = f" [🔁 反覆第 {pm.repeat_pass} 遍]" if pm.repeat_pass >= 2 else ""
-        self.status_text.setText(f"已跳至第 {m.measure_number} 小節{pass_tag}（共 {len(m.notes)} 個事件）。")
 
     # === 逐音符步進與單音校準試聽 ===
     def _on_prev_note(self):
@@ -1454,15 +1350,6 @@ class AutoScrollPage(QWidget):
             event.accept()
         elif key == Qt.Key.Key_BracketRight:
             self._on_next_note()
-            event.accept()
-        elif key == Qt.Key.Key_M:
-            self._on_play_current_measure()
-            event.accept()
-        elif key in (Qt.Key.Key_PageUp, Qt.Key.Key_Left):
-            self._on_prev_measure()
-            event.accept()
-        elif key in (Qt.Key.Key_PageDown, Qt.Key.Key_Right):
-            self._on_next_measure()
             event.accept()
         elif key == Qt.Key.Key_Home:
             self._on_restart()

@@ -258,9 +258,9 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         self.assertTrue(page.load_file(path))
         self.assertAlmostEqual(page._analysis.total_beats, 10.0, places=2)
 
-        # 步進到第 4 個播放小節應跳回 M2 [第 2 遍]
-        for _ in range(3):
-            page._on_next_measure()
+        # 定位至第 4 個播放小節起點（6.0 拍）應對應回跳 M2 [第 2 遍]
+        page._current_beat = 6.05
+        page._sync_playhead_visual(scroll_to_staff=False)
         _, ev_pass2 = page._find_event_at_beat(page._current_beat)
         self.assertEqual(ev_pass2.measure_number, 2)
         self.assertEqual(ev_pass2.repeat_pass, 2)
@@ -296,15 +296,12 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         idx0, _ = page._find_event_at_beat(page._current_beat)
         self.assertEqual(idx0, 0)
 
-        # 2. 測試逐小節跳轉與「播本小節」自動設定停止拍點
-        page._on_next_measure()
-        _, ev_m2 = page._find_event_at_beat(page._current_beat)
-        self.assertEqual(ev_m2.measure_number, 2)
-
-        page._on_play_current_measure()
-        self.assertTrue(page._is_playing)
-        self.assertIsNotNone(page._stop_at_beat)
-        page._stop_playing()
+        # 2. 驗證逐小節控制按鈕已依需求移除，同時保留逐音符步進與試聽
+        self.assertFalse(hasattr(page, "prev_measure_btn"))
+        self.assertFalse(hasattr(page, "play_measure_btn"))
+        self.assertFalse(hasattr(page, "next_measure_btn"))
+        self.assertTrue(hasattr(page, "prev_note_btn"))
+        self.assertTrue(hasattr(page, "next_note_btn"))
 
         # 3. 測試開啟「顯示偵測標記」與切換「去底色強化」渲染無誤
         self.assertTrue(page.enhance_view_chk.isChecked())
