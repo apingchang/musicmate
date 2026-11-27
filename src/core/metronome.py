@@ -18,7 +18,9 @@ import numpy as np
 _audio_backend = None
 try:
     import pygame
-    pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+    if not pygame.mixer.get_init():
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
+    pygame.mixer.set_num_channels(24)
     _audio_backend = "pygame"
 except Exception:
     try:

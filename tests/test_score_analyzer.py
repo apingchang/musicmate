@@ -675,6 +675,84 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         m5_notes = st0.measures[4].notes
         self.assertEqual([n.note_name for n in m5_notes], ["A4"])
 
+    def test_accent_mark_slashed_grace_sharp_and_staff_end_note(self):
+        """驗證 OMR v10 與無雜音音訊：重音 > 不誤判 A5、#F5 帶升號倚音不漏檢、行尾最後一音 B4 不截斷、以及波形零邊界爆音與防破音"""
+        w, h = 1500, 260
+        img = np.full((h, w, 3), 255, dtype=np.uint8)
+        sp = 15
+        y_top = 100
+        y_bot = y_top + 4 * sp
+        staff_r = 1280  # 模擬五線譜於 x=1280 結束（行尾最後一顆 B4 距右端僅 ~45px < w//35！）
+        for i in range(5):
+            y = y_top + i * sp
+            cv2.line(img, (60, y), (staff_r, y), (25, 25, 25), 2)
+        cv2.ellipse(img, (95, y_top + 2 * sp), (14, 24), 0, 0, 360, (25, 25, 25), 3)
+        cv2.line(img, (95, y_top - 18), (95, y_bot + 18), (25, 25, 25), 3)
+
+        for bx in (520, 920, staff_r):
+            cv2.line(img, (bx, y_top), (bx, y_bot), (25, 25, 25), 2)
+
+        # M1 (模擬 M21): E5 四分音符正上方有重音記號 >，後接 G#5 + 上方 >（驗證 > 不偷借符幹變成 A5！）
+        e5_y = int(y_bot - 3.5 * sp)
+        g5_y = int(y_top - 0.5 * sp)
+        cv2.ellipse(img, (260, e5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (253, e5_y), (253, y_bot), (15, 15, 15), 2)
+        # 在 E5 正上方繪製重音記號 >
+        cv2.line(img, (249, y_top - 18), (269, y_top - 12), (15, 15, 15), 2)
+        cv2.line(img, (249, y_top - 6), (269, y_top - 12), (15, 15, 15), 2)
+
+        sx1 = 365
+        cv2.line(img, (sx1 - 4, g5_y - 22), (sx1 - 4, g5_y + 21), (15, 15, 15), 2)
+        cv2.line(img, (sx1 + 4, g5_y - 23), (sx1 + 4, g5_y + 20), (15, 15, 15), 2)
+        cv2.line(img, (sx1 - 9, g5_y - 4), (sx1 + 9, g5_y - 7), (15, 15, 15), 4)
+        cv2.line(img, (sx1 - 9, g5_y + 6), (sx1 + 9, g5_y + 3), (15, 15, 15), 4)
+        cv2.ellipse(img, (392, g5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (385, g5_y), (385, g5_y + 3 * sp), (15, 15, 15), 2)
+        cv2.line(img, (382, g5_y - 22), (402, g5_y - 16), (15, 15, 15), 2)
+        cv2.line(img, (382, g5_y - 10), (402, g5_y - 16), (15, 15, 15), 2)
+
+        # M2 (模擬 M45): 縮小版 # + 頂線 F5 斜線裝飾音 + E5 四分音符
+        f5_y = y_top
+        gsx = 562
+        cv2.line(img, (gsx - 3, f5_y - 11), (gsx - 3, f5_y + 11), (15, 15, 15), 2)
+        cv2.line(img, (gsx + 3, f5_y - 12), (gsx + 3, f5_y + 10), (15, 15, 15), 2)
+        cv2.line(img, (gsx - 6, f5_y - 3), (gsx + 6, f5_y - 5), (15, 15, 15), 3)
+        cv2.line(img, (gsx - 6, f5_y + 4), (gsx + 6, f5_y + 2), (15, 15, 15), 3)
+        gx = 580
+        cv2.ellipse(img, (gx, f5_y), (4, 3), -15, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (gx + 4, f5_y), (gx + 4, f5_y - 26), (15, 15, 15), 1)
+        cv2.line(img, (gx + 4, f5_y - 26), (gx + 13, f5_y - 16), (15, 15, 15), 2)
+        cv2.line(img, (gx - 1, f5_y - 12), (gx + 11, f5_y - 22), (15, 15, 15), 2)
+        cv2.ellipse(img, (650, e5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+        cv2.line(img, (643, e5_y), (643, y_bot + 4), (15, 15, 15), 2)
+
+        # M3 (模擬 M47): D5 與緊鄰行尾終止線 (x=1280) 前僅 44px 的最後一音 B4（驗證不被 w//35 截斷！）
+        d5_y = int(y_bot - 3.0 * sp)
+        b4_y = int(y_bot - 2.0 * sp)
+        beam_end_y = y_bot + 12
+        for nx, ny in ((1150, d5_y), (1236, b4_y)):
+            cv2.ellipse(img, (nx, ny), (8, 6), -18, 0, 360, (15, 15, 15), -1)
+            cv2.line(img, (nx - 7, ny), (nx - 7, beam_end_y), (15, 15, 15), 2)
+        cv2.rectangle(img, (1143, beam_end_y - 4), (1230, beam_end_y), (15, 15, 15), -1)
+
+        res = self.analyzer.analyze_pages([img], beats_per_measure=2.0)
+        self.assertTrue(res.has_staves)
+        st0 = res.pages[0].staves[0]
+        self.assertGreaterEqual(len(st0.measures), 3)
+
+        self.assertEqual([n.note_name for n in st0.measures[0].notes], ["E5", "G#5"])
+        self.assertEqual([n.note_name for n in st0.measures[1].notes], ["(F#5)", "E5"])
+        self.assertEqual([n.note_name for n in st0.measures[2].notes], ["D5", "B4"])
+
+        # 驗證音訊合成器起訖端點皆為精確 0（零邊界爆音）且多音疊加峰值具備充足防破音餘裕
+        synth = NoteSynthesizer()
+        for inst in ("鋼琴", "薩克斯風", "小提琴", "長笛"):
+            synth.timbre = inst
+            w_pcm = synth.synthesize_wave(64, 0.15)
+            self.assertEqual(int(np.max(np.abs(w_pcm[0]))), 0)
+            self.assertEqual(int(np.max(np.abs(w_pcm[-1]))), 0)
+            self.assertLessEqual(int(np.max(np.abs(w_pcm))), int(32767 * 0.65))
+
 
 if __name__ == "__main__":
     unittest.main()

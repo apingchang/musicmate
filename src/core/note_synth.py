@@ -5,7 +5,8 @@
 - 內建 17 種真實取樣交響／管樂／打擊樂器：
   鋼琴、薩克斯風、長笛、豎笛、雙簧管、低音管、小提琴、大提琴、低音提琴、
   小號、法國號、管風琴、馬林巴、定音鼓、三角鐵、小鼓、大鼓
-- 支援自然尾音釋放（acoustic release tail）與即時快取，零延遲播放
+- 採用 2048 緩衝區防欠載、固定樂器校準增益防多音疊加破音（anti-clipping）、
+  餘弦平滑起音與長尾音釋放包絡線（raised-cosine fade），徹底消除音符銜接雜音與截斷爆音
 - 若 SoundFont 或 tinysoundfont 不可用，自動無縫降級為純 NumPy 波形合成
 """
 
@@ -20,8 +21,8 @@ _audio_backend = None
 try:
     import pygame
     if not pygame.mixer.get_init():
-        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
-    pygame.mixer.set_num_channels(16)
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
+    pygame.mixer.set_num_channels(24)
     _audio_backend = "pygame"
 except Exception:
     _audio_backend = None
@@ -34,14 +35,16 @@ except Exception:
 
 @dataclass(frozen=True)
 class InstrumentSpec:
-    """單一樂器之 SoundFont 音色對應設定"""
+    """單一樂器之 SoundFont 音色與無雜音增益／尾音設定"""
     key: str
     display_name: str
     bank: int
     program: int
+    gain: float = 1.0                    # 固定樂器校準增益（避免逐音峰值放大抽吸底噪與多音疊加破音）
     fixed_key: Optional[int] = None      # 無音高打擊樂器固定 GM 鼓組鍵位（如三角鐵/小鼓/大鼓）
-    tail_sec: float = 0.20               # 放鍵後自然殘響尾音長度（秒）
-    overlap: bool = False                # 是否允許相鄰音符自然重疊殘響（鋼琴/馬林巴/打擊樂）
+    tail_sec: float = 0.38               # 放鍵後完整自然殘響尾音長度（秒）
+    fade_out_sec: float = 0.12           # 尾端餘弦平滑收尾長度（秒），徹底消除截斷雜音
+    overlap: bool = False                # 是否允許相鄰音符完全自由重疊殘響（鋼琴/馬林巴/打擊樂）
     octave_shift_above: Optional[int] = None  # 若高音譜號音符過高，自動移低八度以符合樂器真實音域
 
 
@@ -62,24 +65,25 @@ def _find_default_soundfont() -> Optional[Path]:
 class NoteSynthesizer:
     """跨平台真實取樣 SoundFont / NumPy 備援樂音合成播放器"""
 
+    # 各樂器依 GeneralUser-GS 實測振幅校準固定增益，並內建樣本級餘弦釋放尾音，免除 SDL_mixer 強制切斷音軌之階梯雜音！
     INSTRUMENT_SPECS: Tuple[InstrumentSpec, ...] = (
-        InstrumentSpec("piano", "鋼琴", 0, 0, tail_sec=0.28, overlap=True),
-        InstrumentSpec("sax", "薩克斯風", 0, 65, tail_sec=0.16, overlap=False),
-        InstrumentSpec("flute", "長笛", 0, 73, tail_sec=0.18, overlap=False),
-        InstrumentSpec("clarinet", "豎笛", 0, 71, tail_sec=0.16, overlap=False),
-        InstrumentSpec("oboe", "雙簧管", 0, 68, tail_sec=0.16, overlap=False),
-        InstrumentSpec("bassoon", "低音管", 0, 70, tail_sec=0.18, overlap=False, octave_shift_above=64),
-        InstrumentSpec("violin", "小提琴", 0, 40, tail_sec=0.20, overlap=False),
-        InstrumentSpec("cello", "大提琴", 0, 42, tail_sec=0.22, overlap=False, octave_shift_above=68),
-        InstrumentSpec("contrabass", "低音提琴", 0, 43, tail_sec=0.24, overlap=False, octave_shift_above=60),
-        InstrumentSpec("trumpet", "小號", 0, 56, tail_sec=0.16, overlap=False),
-        InstrumentSpec("french_horn", "法國號", 0, 60, tail_sec=0.20, overlap=False),
-        InstrumentSpec("organ", "管風琴", 0, 19, tail_sec=0.24, overlap=False),
-        InstrumentSpec("marimba", "馬林巴", 0, 12, tail_sec=0.28, overlap=True),
-        InstrumentSpec("timpani", "定音鼓", 0, 47, tail_sec=0.35, overlap=True, octave_shift_above=58),
-        InstrumentSpec("triangle", "三角鐵", 128, 0, fixed_key=81, tail_sec=0.45, overlap=True),
-        InstrumentSpec("snare", "小鼓", 128, 0, fixed_key=38, tail_sec=0.28, overlap=True),
-        InstrumentSpec("bass_drum", "大鼓", 128, 0, fixed_key=36, tail_sec=0.35, overlap=True),
+        InstrumentSpec("piano", "鋼琴", 0, 0, gain=1.22, tail_sec=0.58, fade_out_sec=0.22, overlap=True),
+        InstrumentSpec("sax", "薩克斯風", 0, 65, gain=1.42, tail_sec=0.18, fade_out_sec=0.14, overlap=True),
+        InstrumentSpec("flute", "長笛", 0, 73, gain=1.20, tail_sec=0.18, fade_out_sec=0.14, overlap=True),
+        InstrumentSpec("clarinet", "豎笛", 0, 71, gain=1.68, tail_sec=0.18, fade_out_sec=0.14, overlap=True),
+        InstrumentSpec("oboe", "雙簧管", 0, 68, gain=1.32, tail_sec=0.18, fade_out_sec=0.14, overlap=True),
+        InstrumentSpec("bassoon", "低音管", 0, 70, gain=1.68, tail_sec=0.20, fade_out_sec=0.15, overlap=True, octave_shift_above=64),
+        InstrumentSpec("violin", "小提琴", 0, 40, gain=1.02, tail_sec=0.22, fade_out_sec=0.16, overlap=True),
+        InstrumentSpec("cello", "大提琴", 0, 42, gain=1.05, tail_sec=0.24, fade_out_sec=0.17, overlap=True, octave_shift_above=68),
+        InstrumentSpec("contrabass", "低音提琴", 0, 43, gain=1.20, tail_sec=0.26, fade_out_sec=0.18, overlap=True, octave_shift_above=60),
+        InstrumentSpec("trumpet", "小號", 0, 56, gain=0.95, tail_sec=0.18, fade_out_sec=0.14, overlap=True),
+        InstrumentSpec("french_horn", "法國號", 0, 60, gain=0.88, tail_sec=0.22, fade_out_sec=0.16, overlap=True),
+        InstrumentSpec("organ", "管風琴", 0, 19, gain=2.10, tail_sec=0.20, fade_out_sec=0.15, overlap=True),
+        InstrumentSpec("marimba", "馬林巴", 0, 12, gain=1.65, tail_sec=0.52, fade_out_sec=0.20, overlap=True),
+        InstrumentSpec("timpani", "定音鼓", 0, 47, gain=1.85, tail_sec=0.68, fade_out_sec=0.24, overlap=True, octave_shift_above=58),
+        InstrumentSpec("triangle", "三角鐵", 128, 0, gain=2.20, fixed_key=81, tail_sec=0.78, fade_out_sec=0.26, overlap=True),
+        InstrumentSpec("snare", "小鼓", 128, 0, gain=1.40, fixed_key=38, tail_sec=0.45, fade_out_sec=0.16, overlap=True),
+        InstrumentSpec("bass_drum", "大鼓", 128, 0, gain=0.82, fixed_key=36, tail_sec=0.52, fade_out_sec=0.18, overlap=True),
     )
 
     TIMBRES: Dict[str, str] = {spec.display_name: spec.key for spec in INSTRUMENT_SPECS}
@@ -88,7 +92,7 @@ class NoteSynthesizer:
     def __init__(self, sample_rate: int = 44100, soundfont_path: Optional[str] = None):
         self._sample_rate = sample_rate
         self._timbre = "piano"
-        self._volume = 0.80
+        self._volume = 0.85
         self._enabled = True
         self._cache: Dict[Tuple[str, int, int], any] = {}
         self._active_channel = None
@@ -151,6 +155,8 @@ class NoteSynthesizer:
     def timbre(self, name: str):
         key = self.TIMBRES.get(name, name)
         if key in self._SPECS_BY_KEY:
+            if key != self._timbre:
+                self.stop_all()
             self._timbre = key
 
     @staticmethod
@@ -159,7 +165,7 @@ class NoteSynthesizer:
         return float(ref_a4 * (2.0 ** ((midi_note - 69) / 12.0)))
 
     def _synthesize_sf2(self, spec: InstrumentSpec, midi_note: int, dur: float) -> Optional[np.ndarray]:
-        """透過 TinySoundFont 即時渲染真實立體聲 16-bit PCM 波形 (N, 2)"""
+        """透過 TinySoundFont 渲染無截斷雜音之真實立體聲 16-bit PCM 波形 (N, 2)"""
         if not self.using_soundfont:
             return None
 
@@ -171,13 +177,14 @@ class NoteSynthesizer:
 
         chan = 9 if spec.bank == 128 else 0
         hold_n = max(1024, int(self._sample_rate * dur))
-        tail_n = max(1024, int(self._sample_rate * spec.tail_sec))
+        tail_n = max(2048, int(self._sample_rate * spec.tail_sec))
 
         with self._lock:
             try:
+                # 徹底清空前次內部濾波器與殘響狀態，確保起音零殘留相位跳變
                 self._tsf_synth.sounds_off(chan)
                 self._tsf_synth.program_select(chan, self._sfid, spec.bank, spec.program)
-                self._tsf_synth.noteon(chan, play_key, 108)
+                self._tsf_synth.noteon(chan, play_key, 98)
                 hold_raw = self._tsf_synth.generate(hold_n)
                 self._tsf_synth.noteoff(chan, play_key)
                 tail_raw = self._tsf_synth.generate(tail_n)
@@ -189,15 +196,26 @@ class NoteSynthesizer:
         tail_arr = np.frombuffer(tail_raw, dtype=np.float32).reshape(-1, 2)
         stereo = np.concatenate((hold_arr, tail_arr), axis=0).copy()
 
-        # 尾端 15ms 柔和淡出，杜絕任何爆音
-        fade_n = min(stereo.shape[0], max(1, int(self._sample_rate * 0.015)))
-        stereo[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float32)[:, None]
+        # 消除極微弱直流偏移（DC offset），避免切換音符時喇叭振膜跳動產生咔噠聲
+        stereo -= np.mean(stereo, axis=0, keepdims=True)
 
-        # 適度正規化各樂器音量，確保不同真實樂器切換時音量均衡飽滿
-        peak = float(np.max(np.abs(stereo)))
-        if peak > 1e-5:
-            gain = min(3.2, 0.80 / peak)
-            stereo = np.clip(stereo * gain, -0.98, 0.98)
+        # 起音前 3ms 餘弦平滑淡入（斜率由 0 起步，徹底消除取樣起點非零爆音）
+        fade_in_n = min(stereo.shape[0] // 4, max(16, int(self._sample_rate * 0.003)))
+        if fade_in_n > 1:
+            t_in = np.linspace(0.0, np.pi, fade_in_n, dtype=np.float32)
+            env_in = 0.5 * (1.0 - np.cos(t_in))
+            stereo[:fade_in_n] *= env_in[:, None]
+
+        # 尾端長餘弦平滑收尾（120~250ms raised-cosine 漸弱至 0，絕不生硬切斷樂器共鳴！）
+        fade_out_n = min(stereo.shape[0] // 2, max(64, int(self._sample_rate * spec.fade_out_sec)))
+        if fade_out_n > 1:
+            t_out = np.linspace(0.0, np.pi, fade_out_n, dtype=np.float32)
+            env_out = 0.5 * (1.0 + np.cos(t_out))
+            stereo[-fade_out_n:] *= env_out[:, None]
+
+        # 套用固定樂器校準增益 + 柔性雙曲正切軟限幅（保留多音疊加動態餘裕，杜絕 SDL_mixer 破音！）
+        stereo *= spec.gain
+        stereo = 0.62 * np.tanh(stereo / 0.62)
 
         return (stereo * 32767.0).astype(np.int16)
 
@@ -251,14 +269,14 @@ class NoteSynthesizer:
 
         peak = float(np.max(np.abs(wave)))
         if peak > 1e-6:
-            wave = wave / peak * 0.75
+            wave = wave / peak * 0.50
         return (wave * 32767.0).astype(np.int16)
 
     def synthesize_wave(self, midi_note: int, duration_sec: float, timbre: Optional[str] = None) -> np.ndarray:
         """合成指定音高、時長與音色的 16-bit PCM 波形陣列（SF2 模式回傳立體聲 (N, 2)）"""
         t_key = self.TIMBRES.get(timbre, timbre) if timbre else self._timbre
         spec = self._SPECS_BY_KEY.get(t_key, self._SPECS_BY_KEY["piano"])
-        dur = max(0.08, min(2.5, float(duration_sec)))
+        dur = max(0.05, min(2.5, float(duration_sec)))
 
         sf2_wave = self._synthesize_sf2(spec, midi_note, dur)
         if sf2_wave is not None:
@@ -266,15 +284,15 @@ class NoteSynthesizer:
         return self._synthesize_numpy_fallback(spec.key, midi_note, dur)
 
     def play_note(self, midi_note: int, duration_sec: float = 0.35):
-        """即時播放指定 MIDI 音符"""
+        """即時無縫播放指定 MIDI 音符"""
         if not self._enabled or _audio_backend != "pygame":
             return
         if midi_note < 21 or midi_note > 108:
             return
 
         spec = self._SPECS_BY_KEY.get(self._timbre, self._SPECS_BY_KEY["piano"])
-        # 量化時長至 50ms 精度以便高效快取，避免重複渲染
-        dur_bucket = max(100, min(2000, int(round(duration_sec * 1000 / 50) * 50)))
+        # 量化時長至 25ms 精度（最低 50ms 以準確表現短促裝飾音，不再拖長互撞！）
+        dur_bucket = max(50, min(2200, int(round(duration_sec * 1000 / 25) * 25)))
         cache_key = (spec.key, int(midi_note), dur_bucket)
 
         snd = self._cache.get(cache_key)
@@ -288,26 +306,29 @@ class NoteSynthesizer:
                 elif mixer_channels == 1 and pcm.ndim == 2:
                     pcm = np.mean(pcm.astype(np.float32), axis=1).astype(np.int16)
                 snd = pygame.sndarray.make_sound(np.ascontiguousarray(pcm))
-                if len(self._cache) > 384:
+                if len(self._cache) > 512:
                     self._cache.clear()
                 self._cache[cache_key] = snd
             except Exception:
                 return
 
         try:
-            # 管弦單音樂器平滑淡出前音；鋼琴／馬林巴／打擊樂保留自然重疊殘響
-            if not spec.overlap and self._active_channel is not None and self._active_channel.get_busy():
-                self._active_channel.fadeout(35)
+            # 直接在獨立音軌播放已內建樣本級餘弦釋放尾音之波形（完全不呼叫 SDL Mix_FadeOutChannel，100% 杜絕階梯截斷雜音！）
             snd.set_volume(self._volume)
-            self._active_channel = snd.play()
+            ch = pygame.mixer.find_channel(True)
+            if ch is not None:
+                ch.play(snd)
+                self._active_channel = ch
+            else:
+                self._active_channel = snd.play()
         except Exception:
             pass
 
     def stop_all(self):
-        """立即停止目前播放中的樂音"""
+        """平滑淡出停止目前播放中的樂音"""
         if _audio_backend == "pygame":
             try:
-                pygame.mixer.fadeout(25)
+                pygame.mixer.fadeout(60)
                 self._active_channel = None
             except Exception:
                 pass

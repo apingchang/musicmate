@@ -439,13 +439,14 @@ class ScoreAnalyzer:
                 strip_bin, sy1, sy2, sp, xl, xr, main_note_pts, horiz_bars
             )
 
-            # 6. 過濾緊鄰小節線的反覆記號雙點 (|: / :|，寬度 < 0.85*sp 且距小節線 < 1.55*sp) 與黏貼於小節線上的假裝飾音（如圓滑線交叉點），並清除誤吸反覆點的假附點
+            # 6. 過濾緊鄰小節線的反覆記號雙點 (|: / :|，必位於譜內第 2~3 間且寬度 < 0.80*sp) 與黏貼於小節線上的假裝飾音（如圓滑線交叉點），並清除誤吸反覆點的假附點
             if bar_infos:
                 raw_notes = [
                     n for n in raw_notes
                     if not (
                         (
-                            n.width < sp * 0.85
+                            n.width < sp * 0.80
+                            and (sy1 + sp * 0.80) <= n.y <= (sy2 - sp * 0.80)
                             and any(b.x_left - sp * 1.50 <= n.x <= b.x_right + sp * 1.50 for b in bar_infos)
                         )
                         or (
@@ -1032,10 +1033,38 @@ class ScoreAnalyzer:
         sy2 = refined_lines[4]
         sp = (sy2 - sy1) / 4.0
 
-        col_proj = np.sum(horiz[max(0, int(sy1 - 3)):min(strip_h, int(sy2 + 4)), :] > 0, axis=0)
-        xs_col = np.where(col_proj >= 2)[0]
+        # 以較短水平核精確定位 5 條譜線的真實左右端點（避免 w//35 長核截斷行尾最後一小節如 M47 的 B4！）
+        horiz_ends = cv2.morphologyEx(
+            strip_bin,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(8, int(round(sp * 0.90))), 1)),
+        )
+        line_hits = np.zeros(w, dtype=np.int32)
+        for rl in refined_lines:
+            ry0 = max(0, int(round(rl)) - 2)
+            ry1 = min(strip_h, int(round(rl)) + 3)
+            line_hits += np.any(horiz_ends[ry0:ry1, :] > 0, axis=0).astype(np.int32)
+        xs_col = np.where(line_hits >= 3)[0]
+        if len(xs_col) == 0:
+            col_proj = np.sum(horiz[max(0, int(sy1 - 3)):min(strip_h, int(sy2 + 4)), :] > 0, axis=0)
+            xs_col = np.where(col_proj >= 2)[0]
         xl = int(xs_col[0]) if len(xs_col) > 0 else 0
         xr = int(xs_col[-1]) if len(xs_col) > 0 else w - 1
+
+        # 若行尾緊接終止小節線，將 xr 向右延伸涵蓋該垂直小節線
+        r_search0 = max(0, xr - 4)
+        r_search1 = min(w, xr + max(6, int(round(sp * 1.4))))
+        if r_search1 > r_search0 and (sy2 - sy1) > 8:
+            v_end = cv2.morphologyEx(
+                strip_bin[:, r_search0:r_search1],
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(8, int(round((sy2 - sy1) * 0.80))))),
+            )
+            v_end_cols = np.where(
+                np.sum(v_end[max(0, int(sy1)):min(strip_h, int(sy2) + 1), :] > 0, axis=0) >= int((sy2 - sy1) * 0.80)
+            )[0]
+            if len(v_end_cols) > 0:
+                xr = min(w - 1, r_search0 + int(v_end_cols[-1]) + 2)
 
         return strip_bin, y_shift, slope_arr, center_dy, sy1, sy2, sp, xl, xr
 
@@ -1373,12 +1402,21 @@ class ScoreAnalyzer:
             ):
                 tenuto_bars.append((float(xl) + float(rcent[rlbl][0]), float(rcent[rlbl][1])))
 
-        # 4. 預先分離貫穿全譜的小節線直欄與臨時記號檢測層，同時減去長橫槓與細直符幹，讓每顆實心符頭 100% 獨立分離
+        # 4. 預先分離貫穿全譜的小節線直欄（必須同時觸及頂線與底線且不大幅突出譜外，絕不誤把 E5/F5 長符幹當成小節線！）
         iy_bar1, iy_bar2 = max(0, int(round(sy1))), min(roi.shape[0], int(round(sy2)) + 1)
-        bar_cols_roi = (
-            np.where(np.sum(v_stems[iy_bar1:iy_bar2, :] > 0, axis=0) >= int((iy_bar2 - iy_bar1) * 0.88))[0]
-            if iy_bar2 > iy_bar1 + 8 else np.array([], dtype=np.int64)
-        )
+        if iy_bar2 > iy_bar1 + 8:
+            span_h = iy_bar2 - iy_bar1
+            cand_bcs = np.where(np.sum(v_stems[iy_bar1:iy_bar2, :] > 0, axis=0) >= int(span_h * 0.92))[0]
+            top_touch = np.any(v_stems[iy_bar1:min(iy_bar2, iy_bar1 + 3), :] > 0, axis=0)
+            bot_touch = np.any(v_stems[max(iy_bar1, iy_bar2 - 3):iy_bar2, :] > 0, axis=0)
+            over_top = np.sum(v_stems[max(0, iy_bar1 - int(sp * 0.95)):max(0, iy_bar1 - 3), :] > 0, axis=0)
+            over_bot = np.sum(v_stems[min(roi.shape[0], iy_bar2 + 3):min(roi.shape[0], iy_bar2 + int(sp * 0.95)), :] > 0, axis=0)
+            bar_cols_roi = np.array(
+                [bc for bc in cand_bcs if top_touch[bc] and bot_touch[bc] and over_top[bc] <= 2 and over_bot[bc] <= 2],
+                dtype=np.int64,
+            )
+        else:
+            bar_cols_roi = np.array([], dtype=np.int64)
         pure_stems_no_bars = pure_stems.copy()
         for bc in bar_cols_roi:
             pure_stems_no_bars[:, max(0, int(bc) - 2):min(roi.shape[1], int(bc) + 3)] = 0
@@ -1512,8 +1550,18 @@ class ScoreAnalyzer:
                     a_ur = float(np.mean(np.any(vk_acc[acc_yu0:acc_yu1, acc_mid_x:acc_x1] > 0, axis=1)))
                     a_dl = float(np.mean(np.any(vk_acc[acc_yd0:acc_yd1, acc_x0:acc_mid_x] > 0, axis=1)))
                     a_dr = float(np.mean(np.any(vk_acc[acc_yd0:acc_yd1, acc_mid_x:acc_x1] > 0, axis=1)))
+                    # 同步檢測小型臨時升記號（如 M45 倚音前的縮小版 #，上下延伸約 ±0.88*sp）
+                    sm_yu0 = max(0, int(round(cy - sp * 0.92)))
+                    sm_yu1 = max(sm_yu0 + 1, int(round(cy - sp * 0.34)))
+                    sm_yd0 = min(roi.shape[0] - 1, int(round(cy + sp * 0.34)))
+                    sm_yd1 = min(roi.shape[0], int(round(cy + sp * 0.92)))
+                    s_ul = float(np.mean(np.any(vk_acc[sm_yu0:sm_yu1, acc_x0:acc_mid_x] > 0, axis=1))) if sm_yu1 > sm_yu0 else 0.0
+                    s_ur = float(np.mean(np.any(vk_acc[sm_yu0:sm_yu1, acc_mid_x:acc_x1] > 0, axis=1))) if sm_yu1 > sm_yu0 else 0.0
+                    s_dl = float(np.mean(np.any(vk_acc[sm_yd0:sm_yd1, acc_x0:acc_mid_x] > 0, axis=1))) if sm_yd1 > sm_yd0 else 0.0
+                    s_dr = float(np.mean(np.any(vk_acc[sm_yd0:sm_yd1, acc_mid_x:acc_x1] > 0, axis=1))) if sm_yd1 > sm_yd0 else 0.0
                     if (
                         (a_ul >= 0.48 and a_ur >= 0.48 and a_dl >= 0.48 and a_dr >= 0.48)
+                        or (cw <= sp * 1.30 and s_ul >= 0.52 and s_ur >= 0.52 and s_dl >= 0.50 and s_dr >= 0.50)
                         or (
                             a_ul >= 0.72 and a_ur >= 0.72
                             and (a_dl >= 0.15 or a_dr >= 0.15)
@@ -1561,6 +1609,14 @@ class ScoreAnalyzer:
                     continue
 
             is_grace_cand = (area_ratio < 0.72) or (cw < sp * 1.06 and n_stems >= 1)
+            # 若符頭寬度充足 (cw >= 1.05*sp, area_ratio >= 0.56) 且帶有標準長下垂符幹（倚音符幹一律朝上，絕無長下垂單幹），必為一般主音符（如 M21 E5）！
+            if is_grace_cand and cw >= sp * 1.05 and area_ratio >= 0.56:
+                dn_check = pure_stems_no_bars[min(roi.shape[0] - 1, ny + ch - 2):min(roi.shape[0], ny + ch + int(sp * 2.8)), max(0, nx - 2):min(roi.shape[1], nx + int(cw * 0.55) + 2)]
+                up_check = pure_stems_no_bars[max(0, ny - int(sp * 2.2)):max(1, ny + 2), max(0, nx - 2):min(roi.shape[1], nx + cw + 2)]
+                dn_len = int(np.max(np.sum(dn_check > 0, axis=0))) if dn_check.size > 0 else 0
+                up_len = int(np.max(np.sum(up_check > 0, axis=0))) if up_check.size > 0 else 0
+                if dn_len >= int(sp * 1.65) and up_len < int(sp * 0.55):
+                    is_grace_cand = False
             if is_grace_cand and n_stems == 0:
                 # 若該小符頭正上方/正下方已有雙倚音短連槓（如 M4/M28 較高的 (D5) 倚音，其符幹較短 < 1.25*sp），仍須保留！
                 under_grace_beam = any(
@@ -1572,18 +1628,40 @@ class ScoreAnalyzer:
                 if not under_grace_beam:
                     continue
 
-            # 位於五線譜上下界之外的真實實心音符必有緊貼自身的長符幹（低於底線之音符符幹必朝上進入五線譜，排除漸強弱記號尖端 > 與延長記號！）
-            if cy > sy2 + sp * 0.58:
-                sx_low0, sx_low1 = max(0, nx - 1), min(roi.shape[1], nx + cw + 1)
-                up_low = pure_stems[max(0, ny - int(sp * 2.5)):min(roi.shape[0], ny + 3), sx_low0:sx_low1]
-                if up_low.size == 0 or int(np.max(np.sum(up_low > 0, axis=0))) < max(7, int(sp * 1.05)):
+            # 排除位於五線譜上方的重音記號 > / ^（左側開口中空、右側收斂成尖端，如 M21 E5 上方的 > 誤判為 A5）
+            if cy < sy1 - sp * 0.25 and cw >= 6 and ch >= 6:
+                raw_sub = roi[ny:ny + ch, nx:nx + cw] > 0
+                l_w = max(2, cw // 3)
+                r_x0 = max(l_w, cw - max(2, cw // 3))
+                l_part = raw_sub[:, :l_w]
+                r_part = raw_sub[:, r_x0:]
+                mid_r0 = max(1, ch // 2 - 1)
+                mid_r1 = min(ch - 1, ch // 2 + 2)
+                l_top_has = bool(np.any(l_part[:mid_r0, :]))
+                l_bot_has = bool(np.any(l_part[mid_r1:, :]))
+                l_mid_fill = float(np.mean(l_part[mid_r0:mid_r1, :])) if mid_r1 > mid_r0 else 1.0
+                r_ys = np.where(np.any(r_part, axis=1))[0]
+                r_span = int(r_ys[-1] - r_ys[0] + 1) if len(r_ys) > 0 else 0
+                if l_top_has and l_bot_has and l_mid_fill < 0.25 and r_span <= int(ch * 0.68):
                     continue
-            elif cy < sy1 - sp * 0.58 and n_stems == 0:
+
+            # 位於五線譜上下界之外的真實實心音符必有「直接接觸自身邊界」的長符幹（徹底杜絕重音記號 > 跨越空白間隙偷借下方 E5 的符幹！）
+            if cy > sy2 + sp * 0.55:
+                sx_low0, sx_low1 = max(0, nx - 1), min(roi.shape[1], nx + cw + 1)
+                touch_low = pure_stems_no_bars[max(0, ny - 4):min(roi.shape[0], ny + ch + 3), sx_low0:sx_low1]
+                up_low = pure_stems_no_bars[max(0, ny - int(sp * 2.5)):min(roi.shape[0], ny + 3), sx_low0:sx_low1]
+                if (
+                    touch_low.size == 0 or int(np.sum(touch_low > 0)) < 2
+                    or up_low.size == 0 or int(np.max(np.sum(up_low > 0, axis=0))) < max(7, int(sp * 1.05))
+                ):
+                    continue
+            elif cy < sy1 - sp * 0.55 and n_stems == 0:
                 sx_hi0, sx_hi1 = max(0, nx - 1), min(roi.shape[1], nx + cw + 1)
+                touch_hi = pure_stems_no_bars[max(0, ny - 3):min(roi.shape[0], ny + ch + 4), sx_hi0:sx_hi1]
                 sy_ext0 = max(0, ny - int(sp * 1.8))
                 sy_ext1 = min(roi.shape[0], ny + ch + int(sp * 1.8))
-                ext_stem = int(np.max(np.sum(pure_stems[sy_ext0:sy_ext1, sx_hi0:sx_hi1] > 0, axis=0))) if sx_hi1 > sx_hi0 else 0
-                if ext_stem < max(7, int(sp * 1.05)):
+                ext_stem = int(np.max(np.sum(pure_stems_no_bars[sy_ext0:sy_ext1, sx_hi0:sx_hi1] > 0, axis=0))) if sx_hi1 > sx_hi0 else 0
+                if touch_hi.size == 0 or int(np.sum(touch_hi > 0)) < 2 or ext_stem < max(7, int(sp * 1.05)):
                     continue
 
             # 以符頭核心厚實直欄（排除邊緣 1~2px 符幹與譜線十字交點殘刺）計算精準垂直中心 core_cy，避免 C5 被交點往下拉成 B4！
@@ -1607,10 +1685,18 @@ class ScoreAnalyzer:
                 )
             )
 
-        # 4b. 補救被主符頭開運算侵蝕之小型單倚音（如 M45 譜線上的帶斜線倚音）：需具備緊貼右側的向上細直符幹與頂端旗標/斜線，且排除 ♭/♯/♮ 與小節線
-        sm_w = max(2, int(round(sp * 0.34)))
-        sm_h = max(2, int(round(sp * 0.28)))
-        sm_mask = cv2.morphologyEx(roi_clean, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (sm_w, sm_h)))
+        # 4b. 補救被主符頭開運算或厚譜線侵蝕之小型單倚音（如 M45 譜線上的帶斜線倚音）：閉合譜線細縫還原扁小符頭，結合右側向上細符幹與頂端斜線判別
+        grace_rejoined = cv2.morphologyEx(
+            no_staff_roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(2, max_thin)))
+        )
+        grace_clean = cv2.subtract(
+            cv2.subtract(grace_rejoined, cv2.dilate(beams_mask, np.ones((2, 2), np.uint8))),
+            pure_stems,
+        )
+        grace_src = cv2.bitwise_or(roi_clean, grace_clean)
+        sm_w = max(2, int(round(sp * 0.22)))
+        sm_h = max(2, int(round(sp * 0.20)))
+        sm_mask = cv2.morphologyEx(grace_src, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (sm_w, sm_h)))
         sm_num, _, sm_stats, sm_cent = cv2.connectedComponentsWithStats(sm_mask)
         sm_order = sorted(range(1, sm_num), key=lambda idx: int(sm_stats[idx, cv2.CC_STAT_TOP]))
         for slbl in sm_order:
@@ -1628,10 +1714,10 @@ class ScoreAnalyzer:
             s_ar = sarea / max(1.0, sp * sp)
             s_asp = scw / max(1.0, float(sch))
             if not (
-                (sp * 0.26 <= sch <= sp * 0.72)
-                and (sp * 0.34 <= scw <= sp * 0.95)
-                and (0.75 <= s_asp <= 2.15)
-                and (0.11 <= s_ar < 0.55)
+                (sp * 0.19 <= sch <= sp * 0.75)
+                and (sp * 0.30 <= scw <= sp * 0.98)
+                and (0.70 <= s_asp <= 2.60)
+                and (0.08 <= s_ar < 0.55)
                 and ((sy1 - sp * 1.8) <= scy <= (sy2 + sp * 1.8))
             ):
                 continue
@@ -1651,8 +1737,9 @@ class ScoreAnalyzer:
             up_r_cov = float(np.mean(np.any(vk_acc[sy_u0:sy_u1, sx_r0:sx_r1] > 0, axis=1))) if (sx_r1 > sx_r0 and sy_u1 > sy_u0) else 0.0
             up_l_cov = float(np.mean(np.any(vk_acc[sy_u0:sy_u1, sx_l0:sx_l1] > 0, axis=1))) if (sx_l1 > sx_l0 and sy_u1 > sy_u0) else 0.0
             dn_all = int(np.max(np.sum(pure_stems_no_bars[sy_d0:sy_d1, sx_l0:sx_r1] > 0, axis=0))) if (sy_d1 > sy_d0 and sx_r1 > sx_l0) else 0
+            dn_l_cov = float(np.mean(np.any(vk_acc[sy_d0:min(roi.shape[0], sny + sch + int(round(sp * 0.75))), sx_l0:sx_l1] > 0, axis=1))) if (sx_l1 > sx_l0 and sy_d1 > sy_d0) else 0.0
             has_grace_up_stem = (up_r_stem >= max(6, int(round(sp * 1.05)))) or (up_r_cov >= 0.55)
-            if (not has_grace_up_stem) or up_l_cov >= 0.35 or dn_all >= max(5, int(round(sp * 0.65))):
+            if (not has_grace_up_stem) or up_l_cov >= 0.35 or dn_l_cov >= 0.45 or dn_all >= max(5, int(round(sp * 0.65))):
                 continue
             flag_y0 = max(0, sny - int(round(sp * 2.4)))
             flag_y1 = max(flag_y0 + 1, sny - int(round(sp * 0.55)))
@@ -1900,6 +1987,51 @@ class ScoreAnalyzer:
                     (n.is_grace or n.is_hollow)
                     and any(z0 <= n.x <= z1 for z0, z1 in accidental_kill_zones)
                 )
+            ]
+
+        # 7b-2. 為獨立單顆裝飾音偵測緊鄰左側之縮小版臨時升記號（如 M45 開頭的 #F5 倚音）
+        grace_kill_zones: List[Tuple[float, float]] = []
+        for g_idx, gn in enumerate(merged):
+            if not gn.is_grace:
+                continue
+            gx_r = int(round(gn.x - max(gn.width * 0.50, sp * 0.38)))
+            gx_l = max(int(round(header_end_x)), int(round(gn.x - sp * 1.65)))
+            if g_idx > 0 and not merged[g_idx - 1].is_grace:
+                gx_l = max(gx_l, int(round(merged[g_idx - 1].x + sp * 0.65)))
+            if len(bar_cols_roi) > 0:
+                gbars = bar_cols_roi[(xl + bar_cols_roi >= gx_l - 2) & (xl + bar_cols_roi <= gx_r)]
+                if len(gbars) > 0:
+                    gx_l = max(gx_l, int(xl + gbars[-1] + 3))
+            if gx_r - gx_l < int(sp * 0.36):
+                continue
+            gym0 = max(0, int(round(gn.y - sp * 0.42)))
+            gym1 = min(strip_bin.shape[0], int(round(gn.y + sp * 0.42)))
+            gmid = vk_full[gym0:gym1, gx_l:gx_r] > 0
+            if int(np.sum(gmid)) < int(sp * sp * 0.14):
+                continue
+            gcols = np.where(np.sum(gmid, axis=0) >= 2)[0]
+            if len(gcols) < max(3, int(sp * 0.28)):
+                continue
+            gbx0 = gx_l + int(gcols[0])
+            gbx1 = gx_l + int(gcols[-1]) + 1
+            if (gbx1 - gbx0) > int(round(sp * 1.15)):
+                continue
+            gmid_x = (gbx0 + gbx1) // 2
+            gyu0 = max(0, int(round(gn.y - sp * 0.95)))
+            gyu1 = max(gyu0 + 1, int(round(gn.y - sp * 0.34)))
+            gyd0 = min(strip_bin.shape[0] - 1, int(round(gn.y + sp * 0.34)))
+            gyd1 = min(strip_bin.shape[0], int(round(gn.y + sp * 0.95)))
+            gul = float(np.mean(np.any(vk_full[gyu0:gyu1, gbx0:gmid_x] > 0, axis=1))) if gmid_x > gbx0 else 0.0
+            gur = float(np.mean(np.any(vk_full[gyu0:gyu1, gmid_x:gbx1] > 0, axis=1))) if gbx1 > gmid_x else 0.0
+            gdl = float(np.mean(np.any(vk_full[gyd0:gyd1, gbx0:gmid_x] > 0, axis=1))) if gmid_x > gbx0 else 0.0
+            gdr = float(np.mean(np.any(vk_full[gyd0:gyd1, gmid_x:gbx1] > 0, axis=1))) if gbx1 > gmid_x else 0.0
+            if gul >= 0.48 and gur >= 0.48 and gdl >= 0.45 and gdr >= 0.45:
+                gn.accidental = 1
+                grace_kill_zones.append((float(gbx0 - 2), float(gbx1 + 2)))
+        if grace_kill_zones:
+            merged = [
+                n for n in merged
+                if not (n.is_grace and n.accidental == 0 and any(z0 <= n.x <= z1 for z0, z1 in grace_kill_zones))
             ]
 
         # 7c. 清除升降號殘片後，將連接主連槓之偏小十六分主音符（如 M5 的 D5）還原為一般主音符！
