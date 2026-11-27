@@ -1264,10 +1264,28 @@ class ScoreAnalyzer:
 
         header_end_x = min(float(xr) - sp, float(xl) + header_skip)
 
-        # 3. 提取細直符幹與小節線 (pure_stems)，以及長橫槓/多小節休止條 (beams_mask)
+        # 3. 提取細直符幹 (pure_stems)、預先分離貫穿全譜的小節線直欄 (pure_stems_no_bars)，再擷取長橫槓/多小節休止條 (beams_mask)
         v_stems = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(6, int(round(sp * 1.4))))))
         horiz_thick = cv2.morphologyEx(vert_keep, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(round(sp * 0.50))), 1)))
         pure_stems = cv2.subtract(v_stems, horiz_thick)
+
+        iy_bar1, iy_bar2 = max(0, int(round(sy1))), min(roi.shape[0], int(round(sy2)) + 1)
+        if iy_bar2 > iy_bar1 + 8:
+            span_h = iy_bar2 - iy_bar1
+            cand_bcs = np.where(np.sum(v_stems[iy_bar1:iy_bar2, :] > 0, axis=0) >= int(span_h * 0.92))[0]
+            top_touch = np.any(v_stems[iy_bar1:min(iy_bar2, iy_bar1 + 3), :] > 0, axis=0)
+            bot_touch = np.any(v_stems[max(iy_bar1, iy_bar2 - 3):iy_bar2, :] > 0, axis=0)
+            over_top = np.sum(v_stems[max(0, iy_bar1 - int(sp * 0.95)):max(0, iy_bar1 - 3), :] > 0, axis=0)
+            over_bot = np.sum(v_stems[min(roi.shape[0], iy_bar2 + 3):min(roi.shape[0], iy_bar2 + int(sp * 0.95)), :] > 0, axis=0)
+            bar_cols_roi = np.array(
+                [bc for bc in cand_bcs if top_touch[bc] and bot_touch[bc] and over_top[bc] <= 2 and over_bot[bc] <= 2],
+                dtype=np.int64,
+            )
+        else:
+            bar_cols_roi = np.array([], dtype=np.int64)
+        pure_stems_no_bars = pure_stems.copy()
+        for bc in bar_cols_roi:
+            pure_stems_no_bars[:, max(0, int(bc) - 2):min(roi.shape[1], int(bc) + 3)] = 0
 
         beam_w = max(8, int(round(sp * 1.65)))
         beam_h = max(max_thin + 1, int(round(sp * 0.30)))
@@ -1283,15 +1301,41 @@ class ScoreAnalyzer:
             bw = int(bstats[lbl, cv2.CC_STAT_WIDTH])
             bh = int(bstats[lbl, cv2.CC_STAT_HEIGHT])
             cy = float(bcent[lbl][1])
-            # 真實連槓必連接 >=2 根獨立符幹，或多小節休止橫條寬度 >= 2.25*sp；排除單顆符頭連帶殘留譜線被誤切！
-            sx0, sx1 = max(0, bx - 2), min(roi.shape[1], bx + bw + 2)
+            # 以排除小節線後的 pure_stems_no_bars（左右放寬 0.35*sp 涵蓋斜連槓末端符幹如 M47 D5-B4）計算真實連接符幹數！
+            sx_pad = max(4, int(round(sp * 0.35)))
+            sx0, sx1 = max(0, bx - sx_pad), min(roi.shape[1], bx + bw + sx_pad)
             sy0, sy1_b = max(0, by - int(sp * 0.8)), min(roi.shape[0], by + bh + int(sp * 0.8))
-            b_scols = np.where(np.sum(pure_stems[sy0:sy1_b, sx0:sx1] > 0, axis=0) >= 3)[0]
+            b_scols = np.where(np.sum(pure_stems_no_bars[sy0:sy1_b, sx0:sx1] > 0, axis=0) >= 3)[0]
             b_nstems = (1 + int(np.sum(np.diff(b_scols) > min_beam_stem_gap))) if len(b_scols) > 0 else 0
-            if bw < sp * 2.25 and b_nstems < 2:
-                continue
-            beams_mask[blabels == lbl] = 255
             in_mid = (sy1 + sp * 1.15) <= cy <= (sy2 - sp * 1.15)
+            bar_col_hs = np.sum((blabels[by:by + bh, bx:bx + bw] == lbl), axis=0)
+            p35_bar_h = float(np.percentile(bar_col_hs, 35)) if bar_col_hs.size > 0 else 0.0
+            min_line_d = min(abs(cy - (sy1 + k_s * sp)) for k_s in range(5))
+            touches_barline = len(bar_cols_roi) > 0 and bool(np.any((bar_cols_roi >= bx - 3) & (bar_cols_roi <= bx + bw + 3)))
+            # 排除局部偏粗五線譜線（如 M47 行尾偏粗第 3 線直抵終止線或被上下符幹同時貫穿）：絕不誤傷 M13/M16 等單側符幹匯聚的真實連槓！
+            if min_line_d <= sp * 0.25 and p35_bar_h <= max(float(max_thin + 2), sp * 0.38):
+                up_band_b = pure_stems_no_bars[max(0, by - int(sp * 1.1)):max(1, by - 1), sx0:sx1]
+                dn_band_b = pure_stems_no_bars[min(roi.shape[0] - 1, by + bh + 1):min(roi.shape[0], by + bh + int(sp * 1.1)), sx0:sx1]
+                n_up_b = int(np.sum(np.sum(up_band_b > 0, axis=0) >= max(3, int(sp * 0.45)))) if up_band_b.size > 0 else 0
+                n_dn_b = int(np.sum(np.sum(dn_band_b > 0, axis=0) >= max(3, int(sp * 0.45)))) if dn_band_b.size > 0 else 0
+                if touches_barline or (n_up_b >= 1 and n_dn_b >= 1 and p35_bar_h <= max(float(max_thin + 1), sp * 0.34)):
+                    continue
+            if b_nstems < 2:
+                med_bar_h = float(np.median(bar_col_hs)) if bar_col_hs.size > 0 else 0.0
+                is_outer_slanted_beam = (
+                    bw >= sp * 2.25
+                    and (cy > sy2 + sp * 0.35 or cy < sy1 - sp * 0.35)
+                    and med_bar_h >= max(4.0, sp * 0.40)
+                    and b_nstems >= 1
+                )
+                if not is_outer_slanted_beam:
+                    if bw < sp * 2.25 or not in_mid or touches_barline:
+                        continue
+                    low_stem_patch = pure_stems_no_bars[min(roi.shape[0] - 1, int(sy2 - 2)):min(roi.shape[0], int(sy2 + sp * 1.2)), sx0:sx1]
+                    low_stem_h = int(np.max(np.sum(low_stem_patch > 0, axis=0))) if low_stem_patch.size > 0 else 0
+                    if med_bar_h < max(3.5, sp * 0.40) or low_stem_h >= max(4, int(sp * 0.55)):
+                        continue
+            beams_mask[blabels == lbl] = 255
             horiz_bars.append(
                 _HorizBar(
                     x1=float(xl + bx),
@@ -1402,25 +1446,7 @@ class ScoreAnalyzer:
             ):
                 tenuto_bars.append((float(xl) + float(rcent[rlbl][0]), float(rcent[rlbl][1])))
 
-        # 4. 預先分離貫穿全譜的小節線直欄（必須同時觸及頂線與底線且不大幅突出譜外，絕不誤把 E5/F5 長符幹當成小節線！）
-        iy_bar1, iy_bar2 = max(0, int(round(sy1))), min(roi.shape[0], int(round(sy2)) + 1)
-        if iy_bar2 > iy_bar1 + 8:
-            span_h = iy_bar2 - iy_bar1
-            cand_bcs = np.where(np.sum(v_stems[iy_bar1:iy_bar2, :] > 0, axis=0) >= int(span_h * 0.92))[0]
-            top_touch = np.any(v_stems[iy_bar1:min(iy_bar2, iy_bar1 + 3), :] > 0, axis=0)
-            bot_touch = np.any(v_stems[max(iy_bar1, iy_bar2 - 3):iy_bar2, :] > 0, axis=0)
-            over_top = np.sum(v_stems[max(0, iy_bar1 - int(sp * 0.95)):max(0, iy_bar1 - 3), :] > 0, axis=0)
-            over_bot = np.sum(v_stems[min(roi.shape[0], iy_bar2 + 3):min(roi.shape[0], iy_bar2 + int(sp * 0.95)), :] > 0, axis=0)
-            bar_cols_roi = np.array(
-                [bc for bc in cand_bcs if top_touch[bc] and bot_touch[bc] and over_top[bc] <= 2 and over_bot[bc] <= 2],
-                dtype=np.int64,
-            )
-        else:
-            bar_cols_roi = np.array([], dtype=np.int64)
-        pure_stems_no_bars = pure_stems.copy()
-        for bc in bar_cols_roi:
-            pure_stems_no_bars[:, max(0, int(bc) - 2):min(roi.shape[1], int(bc) + 3)] = 0
-
+        # 4. 建立去連槓、去符幹之純符頭候選遮罩 roi_clean
         h_acc_lines = cv2.morphologyEx(
             roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(14, int(round(sp * 1.45))), 1))
         )
@@ -1428,6 +1454,33 @@ class ScoreAnalyzer:
 
         roi_clean = cv2.subtract(vert_keep, cv2.dilate(beams_mask, np.ones((2, 2), np.uint8)))
         roi_clean = cv2.subtract(roi_clean, pure_stems)
+        # 僅針對異常超寬連通塊 (cw > 2.15*sp) 切除沿五線譜延伸之局部偏粗殘留譜線翼（如書頁邊緣 M47 局部 4~5px 譜線串聯 B4 形成超寬塊），絕不觸碰一般獨立符頭或裝飾音！
+        max_leak_h = max(max_thin + 2, int(round(sp * 0.44)))
+        min_wing_cols = max(4, int(round(sp * 0.38)))
+        num_rc, rc_labels, rc_stats, _ = cv2.connectedComponentsWithStats(roi_clean)
+        for rc_lbl in range(1, num_rc):
+            rc_cw = int(rc_stats[rc_lbl, cv2.CC_STAT_WIDTH])
+            if rc_cw <= int(round(sp * 2.15)):
+                continue
+            rc_x = int(rc_stats[rc_lbl, cv2.CC_STAT_LEFT])
+            rc_y = int(rc_stats[rc_lbl, cv2.CC_STAT_TOP])
+            rc_ch = int(rc_stats[rc_lbl, cv2.CC_STAT_HEIGHT])
+            for k_l in range(5):
+                yc_l = int(round(sy1 + k_l * sp))
+                if not (rc_y - 2 <= yc_l <= rc_y + rc_ch + 2):
+                    continue
+                by0_l = max(0, yc_l - int(round(sp * 0.52)))
+                by1_l = min(roi.shape[0], yc_l + int(round(sp * 0.52)) + 1)
+                if by1_l <= by0_l:
+                    continue
+                comp_band = rc_labels[by0_l:by1_l, rc_x:rc_x + rc_cw] == rc_lbl
+                thin_cols = np.where(np.sum(comp_band, axis=0) <= max_leak_h)[0]
+                if len(thin_cols) >= min_wing_cols:
+                    xs_abs = rc_x + thin_cols
+                    sub_mask = rc_labels[by0_l:by1_l, xs_abs] == rc_lbl
+                    sub_rc = roi_clean[by0_l:by1_l, xs_abs]
+                    sub_rc[sub_mask] = 0
+                    roi_clean[by0_l:by1_l, xs_abs] = sub_rc
 
         nh_w = max(3, int(round(sp * 0.50)))
         nh_h = max(3, int(round(sp * 0.44)))

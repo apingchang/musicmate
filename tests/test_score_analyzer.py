@@ -723,9 +723,10 @@ class TestScoreAnalyzerAndTracking(unittest.TestCase):
         cv2.ellipse(img, (650, e5_y), (8, 6), -18, 0, 360, (15, 15, 15), -1)
         cv2.line(img, (643, e5_y), (643, y_bot + 4), (15, 15, 15), 2)
 
-        # M3 (模擬 M47): D5 與緊鄰行尾終止線 (x=1280) 前僅 44px 的最後一音 B4（驗證不被 w//35 截斷！）
+        # M3 (模擬 M47): D5 與緊鄰行尾終止線前之 B4，且第 3 線在行尾局部偏粗 (4px vs 全域 2px，橫跨雙符幹與終止線)，驗證絕不被誤當 H-bar 連槓或超寬塊抹除！
         d5_y = int(y_bot - 3.0 * sp)
         b4_y = int(y_bot - 2.0 * sp)
+        cv2.line(img, (1120, b4_y), (staff_r, b4_y), (20, 20, 20), 4)
         beam_end_y = y_bot + 12
         for nx, ny in ((1150, d5_y), (1236, b4_y)):
             cv2.ellipse(img, (nx, ny), (8, 6), -18, 0, 360, (15, 15, 15), -1)
