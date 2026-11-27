@@ -78,9 +78,11 @@ class TestAutoScrollPage(unittest.TestCase):
         self.assertTrue(self.page._scroll_timer.isActive())
         
         # 調整速度
-        self.page._on_speed_change(20)  # 2.0x
+        self.page.speed_spin.setValue(2.0)  # 2.0x（可直接輸入或上下微調，步進 0.1）
         self.assertEqual(self.page._scroll_speed, 2.0)
-        self.assertEqual(self.page.speed_value_label.text(), "2.0x")
+        self.assertEqual(self.page.speed_spin.text(), "2.0x")
+        self.page.speed_spin.stepUp()
+        self.assertAlmostEqual(self.page._scroll_speed, 2.1)
         
         # 暫停播放
         self.page._on_play_toggle()

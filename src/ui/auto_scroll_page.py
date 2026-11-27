@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QFileDialog,
     QMessageBox, QScrollArea, QFrame, QSizePolicy,
-    QSpinBox, QComboBox, QCheckBox
+    QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPointF, QRectF
 from PyQt6.QtGui import (
@@ -476,18 +476,16 @@ class AutoScrollPage(QWidget):
         row1.addWidget(self.time_sig_combo)
 
         row1.addWidget(QLabel("倍率："))
-        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
-        self.speed_slider.setMinimum(5)
-        self.speed_slider.setMaximum(30)
-        self.speed_slider.setValue(10)
-        self.speed_slider.setFixedWidth(95)
-        self.speed_slider.valueChanged.connect(self._on_speed_change)
-        row1.addWidget(self.speed_slider)
-
-        self.speed_value_label = QLabel("1.0x")
-        self.speed_value_label.setMinimumWidth(38)
-        self.speed_value_label.setStyleSheet("font-weight: bold; color: #333;")
-        row1.addWidget(self.speed_value_label)
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.5, 3.0)
+        self.speed_spin.setSingleStep(0.1)
+        self.speed_spin.setDecimals(1)
+        self.speed_spin.setSuffix("x")
+        self.speed_spin.setValue(1.0)
+        self.speed_spin.setFixedWidth(76)
+        self.speed_spin.setMinimumHeight(26)
+        self.speed_spin.valueChanged.connect(self._on_speed_change)
+        row1.addWidget(self.speed_spin)
 
         row1.addStretch()
 
@@ -1045,8 +1043,7 @@ class AutoScrollPage(QWidget):
             self.score_view.clear_playhead()
 
     def _on_speed_change(self, value):
-        self._scroll_speed = value / 10.0
-        self.speed_value_label.setText(f"{self._scroll_speed:.1f}x")
+        self._scroll_speed = round(float(value), 1)
 
     def _on_scroll_tick(self):
         if not self._is_playing:
