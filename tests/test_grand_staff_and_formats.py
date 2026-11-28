@@ -239,6 +239,27 @@ class TestGrandStaffAndSymbolicFormats(unittest.TestCase):
         self.assertTrue(len(lh_notes) >= 1)
         self.assertEqual(lh_notes[0].note_name, "C3")
 
+    def test_pdf_vector_per_measure_segmented_staff_lines(self):
+        """驗證 MuseScore PDF 逐小節分段繪製的五線譜線（每小節 < 0.35*pw）能完整串接為整行不漏任何小節"""
+        from src.core.pdf_vector_analyzer import PDFVectorAnalyzer
+
+        pw, ph = 595.0, 842.0
+        # 模擬 3 小節分段繪製的雙手大譜表（每小節寬度 165pt ≈ 0.27*pw < 0.35*pw）
+        h_segs = []
+        m_edges = (50.0, 215.0, 380.0, 545.0)
+        for y_base in (140.0, 220.0):
+            for k in range(5):
+                yk = y_base + k * 6.0
+                for mi in range(3):
+                    h_segs.append((yk, m_edges[mi], m_edges[mi + 1]))
+
+        staves = PDFVectorAnalyzer._group_staff_lines(h_segs, pw, ph)
+        self.assertEqual(len(staves), 2)
+        self.assertAlmostEqual(staves[0].x_left, 50.0, delta=1.0)
+        self.assertAlmostEqual(staves[0].x_right, 545.0, delta=1.0)
+        self.assertAlmostEqual(staves[1].x_left, 50.0, delta=1.0)
+        self.assertAlmostEqual(staves[1].x_right, 545.0, delta=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -336,7 +336,7 @@ class PDFVectorAnalyzer:
 
     @staticmethod
     def _extract_line_segments(page) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]:
-        """從 PDF 向量繪圖指令擷取水平線段 (y, x0, x1) 與垂直線段 (x, y0, y1)"""
+        """從 PDF 向量繪圖指令擷取水平線段 (y, x0, x1) 與垂直線段 (x, y0, y1)，相容按小節分段繪製的五線譜"""
         h_segs: List[Tuple[float, float, float]] = []
         v_segs: List[Tuple[float, float, float]] = []
         for dr in page.get_drawings():
@@ -345,16 +345,16 @@ class PDFVectorAnalyzer:
                 if kind == "l":
                     p1, p2 = item[1], item[2]
                     dx, dy = abs(p2.x - p1.x), abs(p2.y - p1.y)
-                    if dy <= 1.2 and dx >= 40.0:
+                    if dy <= 1.2 and dx >= 15.0:
                         h_segs.append((0.5 * (p1.y + p2.y), min(p1.x, p2.x), max(p1.x, p2.x)))
-                    elif dx <= 1.2 and dy >= 14.0:
+                    elif dx <= 1.2 and dy >= 12.0:
                         v_segs.append((0.5 * (p1.x + p2.x), min(p1.y, p2.y), max(p1.y, p2.y)))
                 elif kind == "re":
                     r = item[1]
                     rw, rh = abs(r.width), abs(r.height)
-                    if rh <= 2.5 and rw >= 40.0:
+                    if rh <= 2.5 and rw >= 15.0:
                         h_segs.append((0.5 * (r.y0 + r.y1), r.x0, r.x1))
-                    elif rw <= 2.5 and rh >= 14.0:
+                    elif rw <= 2.5 and rh >= 12.0:
                         v_segs.append((0.5 * (r.x0 + r.x1), r.y0, r.y1))
         return h_segs, v_segs
 
@@ -364,18 +364,33 @@ class PDFVectorAnalyzer:
         pw: float,
         ph: float,
     ) -> List[_VecStaff]:
-        """將長水平線段群組為 5 條等距五線譜"""
-        long_h = [s for s in h_segs if (s[2] - s[1]) >= pw * 0.35]
-        if not long_h:
+        """先將同高度 y 的按小節分段水平線段串接還原成整行譜線，再群組為 5 條等距五線譜"""
+        if not h_segs:
             return []
-        long_h.sort(key=lambda s: s[0])
-        merged_y: List[Tuple[float, float, float]] = []
-        for y, x0, x1 in long_h:
-            if merged_y and abs(y - merged_y[-1][0]) <= 1.5:
-                py, px0, px1 = merged_y[-1]
-                merged_y[-1] = (0.5 * (py + y), min(px0, x0), max(px1, x1))
+        sorted_h = sorted(h_segs, key=lambda s: s[0])
+        y_groups: List[List[Tuple[float, float, float]]] = []
+        for seg in sorted_h:
+            if y_groups and abs(seg[0] - y_groups[-1][0][0]) <= 1.25:
+                y_groups[-1].append(seg)
             else:
-                merged_y.append((y, x0, x1))
+                y_groups.append([seg])
+
+        merged_y: List[Tuple[float, float, float]] = []
+        for grp in y_groups:
+            # 合併同一 y 上的所有 [x0, x1] 區間，計算實際總覆蓋寬度（解決 MuseScore 逐小節畫譜線被 0.35*pw 濾掉的問題！）
+            intervals = sorted((s[1], s[2]) for s in grp)
+            union_iv: List[List[float]] = [[intervals[0][0], intervals[0][1]]]
+            for ix0, ix1 in intervals[1:]:
+                if ix0 <= union_iv[-1][1] + 3.0:
+                    union_iv[-1][1] = max(union_iv[-1][1], ix1)
+                else:
+                    union_iv.append([ix0, ix1])
+            total_cov = sum(iv[1] - iv[0] for iv in union_iv)
+            xl_g = union_iv[0][0]
+            xr_g = union_iv[-1][1]
+            if total_cov >= pw * 0.35 and (xr_g - xl_g) >= pw * 0.38:
+                avg_y = float(np.mean([s[0] for s in grp]))
+                merged_y.append((avg_y, xl_g, xr_g))
 
         staves: List[_VecStaff] = []
         i = 0

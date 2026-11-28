@@ -395,3 +395,8 @@
   - 針對 MuseScore 等軟體匯出之向量 PDF，優先透過 PyMuPDF 讀取內嵌 SMuFL / Emmentaler (MScore) 音樂字型座標與向量五線譜線，精準辨識雙手大譜表、高/低音譜號（`𝄞`/`𝄢`）、調號（如 4♯ `F#, C#, G#, D#`）、拍號（含 `C` 4/4 與 `₵` 2/2）與垂直和弦。
   - 影像 OMR 新增左端貫穿大譜表配對、低音譜號換算、調號套用與 `C`/`₵` 拍號辨識；`NoteSynthesizer` 新增 `play_chord`（支援最長 4.5 秒長音），`AutoScrollPage` 支援同拍點雙手同步發聲與跨雙行紅色游標光條。
 - 新增 `tests/test_grand_staff_and_formats.py`（6 項新測試），全專案 **24 / 24 項單元測試 100% 通過**。
+
+## 2026-11-28 修正數位向量 PDF 逐小節分段五線譜串接漏小節問題
+- **根因**：MuseScore 匯出之向量 PDF 係「逐小節分段」繪製五線譜橫線（單一小節寬度約 `0.22~0.30*pw`），原 `_group_staff_lines` 先以單段長度 `>= 0.35*pw` 篩選導致多數小節被過濾，只剩極寬小節（如 M20）被認出。
+- **修復**（`src/core/pdf_vector_analyzer.py`）：改為先將同高度 `y` 的所有水平線段（`>= 15pt`）合併聯集還原整行譜線，再以整行總覆蓋寬度 `>= 0.35*pw` 篩選，從第 1 頁第 1 小節到結尾所有小節完整銜接不漏檢。
+- 新增 `test_pdf_vector_per_measure_segmented_staff_lines` 回歸測試，全部 **25 / 25 項單元測試通過**。
