@@ -377,3 +377,21 @@
 
 ## 2026-11-28 播放倍率改為數字輸入框
 - 自動捲動頁「倍率」由滑桿改為與 BPM 相同的數字輸入框（`QDoubleSpinBox`）：可直接鍵入數字，或用上下箭頭微調，步進 0.1，範圍 0.5x～3.0x。
+
+
+---
+
+## 2026-11-28 第十四階段（鋼琴雙手大譜表、300 DPI PDF 高清渲染、數位向量 PDF 解析與 MuseScore 全格式支援）
+
+- **PDF 畫質全面升級（解決數位 PDF 像低解析翻拍的問題）**（`src/ui/auto_scroll_page.py`、`src/core/score_analyzer.py`）：
+  - PDF 渲染解析度由 150 DPI 升級至 **300 DPI**（單頁上限 3000px 兼顧銳利度與效能）。
+  - 新增 `ScoreAnalyzer.is_clean_digital_page()` 自動偵測純白數位向量 PDF，自動跳過專為泛黃翻拍紙本設計的 `enhance_score_rgb` 濾鏡，完整保留原始向量抗鋸齒銳利度。
+- **全面支援 MuseScore 下載全部 4 種格式**（新增 `src/core/symbolic_score_loader.py`）：
+  - **MusicXML** (`.musicxml`, `.xml`, `.mxl`)：透過 `music21` 100% 精準解析雙手大譜表、調號、拍號、速度、三連音與和弦。
+  - **MuseScore** (`.mscz`, `.mscx`)：內建純 Python ZIP + XML 原生解析器（相容 MuseScore 3 & 4，免安裝 MuseScore），直接讀取雙手音軌、調號、拍號與連結線。
+  - **MIDI** (`.mid`, `.midi`)：透過 `mido` 解析多軌鋼琴並自動拆分左右手大譜表。
+  - 內建 PyQt6 `QPainter` 抗鋸齒高解析 A4 大譜表樂譜渲染器，載入符號檔即時繪製五線譜、大括弧 `{`、高/低音譜號、調號與音符，並無縫對接自動捲動、紅線游標與點擊試聽。
+- **數位向量 PDF 音樂字型解析 + 影像 OMR 鋼琴雙手大譜表升級**（新增 `src/core/pdf_vector_analyzer.py`、更新 `src/core/score_analyzer.py`、`src/core/note_synth.py`）：
+  - 針對 MuseScore 等軟體匯出之向量 PDF，優先透過 PyMuPDF 讀取內嵌 SMuFL / Emmentaler (MScore) 音樂字型座標與向量五線譜線，精準辨識雙手大譜表、高/低音譜號（`𝄞`/`𝄢`）、調號（如 4♯ `F#, C#, G#, D#`）、拍號（含 `C` 4/4 與 `₵` 2/2）與垂直和弦。
+  - 影像 OMR 新增左端貫穿大譜表配對、低音譜號換算、調號套用與 `C`/`₵` 拍號辨識；`NoteSynthesizer` 新增 `play_chord`（支援最長 4.5 秒長音），`AutoScrollPage` 支援同拍點雙手同步發聲與跨雙行紅色游標光條。
+- 新增 `tests/test_grand_staff_and_formats.py`（6 項新測試），全專案 **24 / 24 項單元測試 100% 通過**。

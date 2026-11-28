@@ -20,7 +20,7 @@ import numpy as np
 
 @dataclass
 class NoteEvent:
-    """單一演奏音符、裝飾音或休止事件（座標皆為原圖歸一化 0.0~1.0）"""
+    """單一演奏音符、和弦、裝飾音或休止事件（座標皆為原圖歸一化 0.0~1.0）"""
     event_index: int
     page_index: int
     staff_index: int
@@ -46,6 +46,19 @@ class NoteEvent:
     repeat_jump_to: int = 0
     accidental: int = 0
     articulation: str = ""
+    midi_notes: List[int] = field(default_factory=list)
+    note_ys_norm: List[float] = field(default_factory=list)
+    clef: str = "treble"
+    hand: str = ""
+    system_index: int = -1
+
+    @property
+    def all_midi_notes(self) -> List[int]:
+        if self.is_rest:
+            return []
+        if self.midi_notes:
+            return [m for m in self.midi_notes if m > 0]
+        return [self.midi_note] if self.midi_note > 0 else []
 
     @property
     def freq_hz(self) -> float:
@@ -84,7 +97,7 @@ class PlaybackMeasure:
 
 @dataclass
 class StaffInfo:
-    """單一行五線譜資訊（含隨 x 變化的傾斜/彎曲上下界軌跡）"""
+    """單一行五線譜資訊（含隨 x 變化的傾斜/彎曲上下界軌跡、譜號與大譜表配對）"""
     page_index: int
     staff_index: int
     y_top_norm: float
@@ -97,6 +110,10 @@ class StaffInfo:
     curve_xs_norm: List[float] = field(default_factory=list)
     curve_y_tops_norm: List[float] = field(default_factory=list)
     staff_height_norm: float = 0.0
+    clef: str = "treble"
+    key_fifths: int = 0
+    system_index: int = -1
+    paired_staff_index: Optional[int] = None
 
     def y_range_at(self, x_norm: float) -> Tuple[float, float]:
         """取得此行五線譜在指定水平位置 x_norm 的精確 (y_top_norm, y_bot_norm)"""
@@ -115,13 +132,15 @@ class PageAnalysis:
     skew_angle: float
     detected_time_sig: Optional[str] = None
     detected_bpm: Optional[int] = None
+    detected_key_fifths: int = 0
+    is_grand_staff: bool = False
     staves: List[StaffInfo] = field(default_factory=list)
     events: List[NoteEvent] = field(default_factory=list)
 
 
 @dataclass
 class ScoreAnalysis:
-    """整份樂譜的分析結果與總演奏時間軸（含反覆記號展開序列與自動辨識拍號/BPM）"""
+    """整份樂譜的分析結果與總演奏時間軸（含反覆記號展開序列與自動辨識拍號/調號/BPM）"""
     pages: List[PageAnalysis] = field(default_factory=list)
     events: List[NoteEvent] = field(default_factory=list)
     playback_measures: List[PlaybackMeasure] = field(default_factory=list)
@@ -132,6 +151,9 @@ class ScoreAnalysis:
     enable_repeats: bool = True
     detected_time_sig: Optional[str] = None
     detected_bpm: Optional[int] = None
+    detected_key_fifths: int = 0
+    is_grand_staff: bool = False
+    source_format: str = "image"
 
     @property
     def has_staves(self) -> bool:
@@ -210,6 +232,27 @@ class ScoreAnalyzer:
         return enhanced.astype(np.uint8)
 
     @classmethod
+    def is_clean_digital_page(cls, rgb: np.ndarray) -> bool:
+        """判斷輸入頁面是否為純白數位向量樂譜（如 MuseScore 匯出之 PDF），避免套用翻拍去底色濾鏡破壞字體抗鋸齒"""
+        if rgb is None or rgb.size == 0:
+            return False
+        if rgb.ndim == 3:
+            # 數位黑白樂譜飽和度極低
+            sat = np.max(rgb, axis=2).astype(np.int16) - np.min(rgb, axis=2).astype(np.int16)
+            if float(np.percentile(sat, 95)) > 14.0:
+                return False
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = rgb
+        # 背景第 85 百分位接近純白且無陰影漸層雜訊
+        p85 = float(np.percentile(gray, 85))
+        bright = gray[gray >= 230]
+        if bright.size < gray.size * 0.65:
+            return False
+        bg_std = float(np.std(bright))
+        return p85 >= 250.0 and bg_std <= 4.5
+
+    @classmethod
     def enhance_score_rgb(cls, rgb: np.ndarray) -> np.ndarray:
         """將輸入彩色樂譜去底色強化為清爽白底黑字 RGB 影像（供 UI 顯示）"""
         if rgb.ndim == 3:
@@ -246,9 +289,45 @@ class ScoreAnalyzer:
                 analysis.detected_time_sig = page_res.detected_time_sig
             if analysis.detected_bpm is None and page_res.detected_bpm:
                 analysis.detected_bpm = page_res.detected_bpm
+            if page_res.is_grand_staff:
+                analysis.is_grand_staff = True
+            if analysis.detected_key_fifths == 0 and page_res.detected_key_fifths != 0:
+                analysis.detected_key_fifths = page_res.detected_key_fifths
             analysis.pages.append(page_res)
 
-        analysis.total_measures = measure_counter
+        if analysis.is_grand_staff:
+            # 重新依大譜表系統重編小節總數（雙手共用同一小節號）
+            m_num = 0
+            for p in analysis.pages:
+                visited = set()
+                for s_i, st in enumerate(p.staves):
+                    if s_i in visited:
+                        continue
+                    visited.add(s_i)
+                    pair_i = st.paired_staff_index
+                    if pair_i is not None and 0 <= pair_i < len(p.staves) and pair_i not in visited:
+                        visited.add(pair_i)
+                        lh_st = p.staves[pair_i]
+                        n_m = max(len(st.measures), len(lh_st.measures))
+                        for k_m in range(n_m):
+                            m_num += 1
+                            if k_m < len(st.measures):
+                                st.measures[k_m].measure_number = m_num
+                                for ev0 in st.measures[k_m].notes:
+                                    ev0.measure_number = m_num
+                            if k_m < len(lh_st.measures):
+                                lh_st.measures[k_m].measure_number = m_num
+                                for ev0 in lh_st.measures[k_m].notes:
+                                    ev0.measure_number = m_num
+                    else:
+                        for m0 in st.measures:
+                            m_num += 1
+                            m0.measure_number = m_num
+                            for ev0 in m0.notes:
+                                ev0.measure_number = m_num
+            analysis.total_measures = m_num
+        else:
+            analysis.total_measures = measure_counter
         self.rebuild_timeline(analysis, beats_per_measure=beats_per_measure, enable_repeats=enable_repeats)
         return analysis
 
@@ -266,6 +345,77 @@ class ScoreAnalyzer:
         analysis.events.clear()
         analysis.playback_measures.clear()
         analysis.repeat_sections.clear()
+
+        # 若為鋼琴雙手大譜表（成對上下行同步時間軸），按 (system_index, measure_number) 同步縮放雙手拍點並合併排序
+        has_paired = analysis.is_grand_staff or any(
+            st.paired_staff_index is not None for p in analysis.pages for st in p.staves
+        )
+        if has_paired:
+            cur_beat = 0.0
+            cur_ev_idx = 0
+            for p in analysis.pages:
+                p.events.clear()
+                visited = set()
+                for s_i, st in enumerate(p.staves):
+                    if s_i in visited:
+                        continue
+                    visited.add(s_i)
+                    pair_i = st.paired_staff_index
+                    if pair_i is not None and 0 <= pair_i < len(p.staves) and pair_i not in visited:
+                        visited.add(pair_i)
+                        lh_st = p.staves[pair_i]
+                        n_m = max(len(st.measures), len(lh_st.measures))
+                        for m_k in range(n_m):
+                            rm = st.measures[m_k] if m_k < len(st.measures) else None
+                            lm = lh_st.measures[m_k] if m_k < len(lh_st.measures) else None
+                            m_dur = beats_per_measure
+                            m_b_start = cur_beat
+                            m_b_end = cur_beat + m_dur
+                            comb: List[NoteEvent] = []
+                            for m_obj in (rm, lm):
+                                if m_obj is None:
+                                    continue
+                                old_m_start = m_obj.beat_start
+                                m_obj.beat_start = m_b_start
+                                m_obj.beat_end = m_b_end
+                                for ev0 in m_obj.notes:
+                                    rel = (ev0.beat_offset - old_m_start) * beat_scale
+                                    ev0.beat_offset = m_b_start + max(0.0, rel)
+                                    ev0.duration_beats *= beat_scale
+                                    comb.append(ev0)
+                            comb.sort(key=lambda e: (round(e.beat_offset, 4), 0 if e.hand != "LH" else 1, e.is_rest))
+                            for ev0 in comb:
+                                cur_ev_idx += 1
+                                ev0.event_index = cur_ev_idx
+                                p.events.append(ev0)
+                                analysis.events.append(ev0)
+                            rep_m = rm if rm is not None else lm
+                            if rep_m is not None:
+                                analysis.playback_measures.append(
+                                    PlaybackMeasure(measure=rep_m, beat_start=m_b_start, beat_end=m_b_end, repeat_pass=1)
+                                )
+                            cur_beat = m_b_end
+                    else:
+                        for m_obj in st.measures:
+                            old_m_start = m_obj.beat_start
+                            m_b_start = cur_beat
+                            m_b_end = cur_beat + beats_per_measure
+                            m_obj.beat_start = m_b_start
+                            m_obj.beat_end = m_b_end
+                            for ev0 in m_obj.notes:
+                                rel = (ev0.beat_offset - old_m_start) * beat_scale
+                                ev0.beat_offset = m_b_start + max(0.0, rel)
+                                ev0.duration_beats *= beat_scale
+                                cur_ev_idx += 1
+                                ev0.event_index = cur_ev_idx
+                                p.events.append(ev0)
+                                analysis.events.append(ev0)
+                            analysis.playback_measures.append(
+                                PlaybackMeasure(measure=m_obj, beat_start=m_b_start, beat_end=m_b_end, repeat_pass=1)
+                            )
+                            cur_beat = m_b_end
+            analysis.total_beats = cur_beat
+            return
 
         phys_measures: List[MeasureInfo] = []
         for p in analysis.pages:
@@ -707,7 +857,75 @@ class ScoreAnalyzer:
 
             page_res.staves.append(staff_info)
 
+        # 若為鋼琴雙手大譜表（左端大括弧/貫穿系統線連接相鄰兩行五線譜），自動配對為雙手系統並將下行轉為低音譜號
+        self._pair_image_grand_staves(clean_gray, page_res)
+
         return page_res, cur_beat, cur_measure, cur_ev_idx
+
+    @classmethod
+    def _pair_image_grand_staves(cls, clean_gray: np.ndarray, page_res: PageAnalysis) -> None:
+        """偵測頁面上成對的鋼琴雙手大譜表（左端貫穿兩行之直線或大括弧），配對為 RH (高音) + LH (低音)"""
+        staves = page_res.staves
+        if len(staves) < 2:
+            return
+        h, w = clean_gray.shape[:2]
+        bin_img = clean_gray < 195
+        i = 0
+        sys_idx = 0
+        while i + 1 < len(staves):
+            s0, s1 = staves[i], staves[i + 1]
+            sp_px = max(6.0, s0.spacing_norm * h)
+            gap_px = (s1.y_top_norm - s0.y_bot_norm) * h
+            if (
+                abs(s0.x_left_norm - s1.x_left_norm) <= 0.035
+                and sp_px * 1.5 <= gap_px <= sp_px * 15.0
+            ):
+                x0 = max(0, int(round(min(s0.x_left_norm, s1.x_left_norm) * w - sp_px * 2.4)))
+                x1 = min(w, int(round(max(s0.x_left_norm, s1.x_left_norm) * w + sp_px * 1.1)))
+                y0 = max(0, int(round(s0.y_bot_norm * h)))
+                y1 = min(h, int(round(s1.y_top_norm * h)))
+                if y1 > y0 + 4 and x1 > x0 + 2:
+                    gap_patch = bin_img[y0:y1, x0:x1]
+                    # 左端貫穿系統直線或大括弧會在 gap_patch 中形成 >= 78% 高度的垂直覆蓋
+                    col_cov = np.mean(gap_patch, axis=0)
+                    row_cov = float(np.mean(np.any(gap_patch, axis=1)))
+                    if float(np.max(col_cov)) >= 0.78 or row_cov >= 0.85:
+                        s0.clef = "treble"
+                        s1.clef = "bass"
+                        s0.system_index = sys_idx
+                        s1.system_index = sys_idx
+                        s0.paired_staff_index = s1.staff_index
+                        s1.paired_staff_index = s0.staff_index
+                        page_res.is_grand_staff = True
+                        for m0 in s0.measures:
+                            for ev in m0.notes:
+                                ev.hand = "RH"
+                                ev.clef = "treble"
+                                ev.system_index = sys_idx
+                        # 將配對之下行 (左手) 所有音符依低音譜號重算音高
+                        for m1 in s1.measures:
+                            for ev in m1.notes:
+                                ev.hand = "LH"
+                                ev.clef = "bass"
+                                ev.system_index = sys_idx
+                                if not ev.is_rest and s1.spacing_norm > 0:
+                                    _, yb_n = s1.y_range_at(ev.x_norm)
+                                    mv, nm = cls._y_to_pitch(
+                                        ev.y_norm, yb_n, s1.spacing_norm,
+                                        clef="bass", key_fifths=s1.key_fifths,
+                                        accidental=ev.accidental,
+                                    )
+                                    ev.midi_note = mv
+                                    ev.midi_notes = [mv]
+                                    ev.note_name = f"({nm})" if ev.is_grace else nm
+                        sys_idx += 1
+                        i += 2
+                        continue
+            s0.system_index = sys_idx
+            sys_idx += 1
+            i += 1
+        if i < len(staves):
+            staves[i].system_index = sys_idx
 
     @staticmethod
     def _detect_curved_staves(clean_gray: np.ndarray) -> List[List[Tuple[float, float, float, float]]]:
@@ -2530,6 +2748,25 @@ class ScoreAnalyzer:
             return f"{num}/4"
         if den == 8 and num == 6:
             return "6/8"
+
+        # 若非上下雙數字拍號，再檢查是否為居中單一 C / ₵ 符號（Common Time 4/4 或 Cut Time 2/2）
+        full_p = vert_keep[max(0, int(round(sy1 - sp * 0.4))):min(vert_keep.shape[0], int(round(sy2 + sp * 0.4))), x0:x1]
+        if full_p.size > 0:
+            ys_f, xs_f = np.where(full_p > 0)
+            if len(xs_f) > 0:
+                fw = int(xs_f.max() - xs_f.min() + 1)
+                fh = int(ys_f.max() - ys_f.min() + 1)
+                crop_f = full_p[ys_f.min():ys_f.max() + 1, xs_f.min():xs_f.max() + 1] > 0
+                if fh >= sp * 1.45 and fw >= sp * 0.75:
+                    mid_band = crop_f[int(fh * 0.38):max(int(fh * 0.38) + 1, int(fh * 0.62)), :]
+                    l_mid = float(np.mean(mid_band[:, :max(1, fw // 3)]))
+                    r_mid = float(np.mean(mid_band[:, max(1, int(fw * 0.68)):]))
+                    if l_mid >= 0.32 and r_mid <= 0.18:
+                        mid_cols = crop_f[:, int(fw * 0.35):max(int(fw * 0.35) + 1, int(fw * 0.68))]
+                        max_v_run = int(np.max(np.sum(mid_cols, axis=0))) if mid_cols.size > 0 else 0
+                        if max_v_run >= int(fh * 0.85):
+                            return "2/2"
+                        return "4/4"
         return None
 
     @classmethod
@@ -2671,27 +2908,43 @@ class ScoreAnalyzer:
         return None
 
     @staticmethod
-    def _y_to_treble_pitch(
+    def _y_to_pitch(
         ny: float,
         y_bot: float,
         sp: float,
+        clef: str = "treble",
+        key_fifths: int = 0,
         accidental: int = 0,
         show_natural: bool = False,
     ) -> Tuple[int, str]:
+        """依譜號 (treble / bass) 與調號 (key_fifths: -7..+7) 將五線譜縱向座標轉為 (MIDI, 音名)"""
         if sp <= 0:
-            return 60, "C4"
+            return (48, "C3") if clef == "bass" else (60, "C4")
         step = int(round((y_bot - ny) / (sp / 2.0)))
-        step = max(-14, min(20, step))
-        diatonic_idx = 2 + step
-        octave = 4 + (diatonic_idx // 7)
-        deg = diatonic_idx % 7
+        step = max(-16, min(20, step))
+        base_diatonic = (4 * 7 + 2) if clef == "treble" else (2 * 7 + 4)  # 高音底線 E4, 低音底線 G2
+        abs_d = base_diatonic + step
+        octave = abs_d // 7
+        deg = abs_d % 7
         semitones = (0, 2, 4, 5, 7, 9, 11)
         names = ("C", "D", "E", "F", "G", "A", "B")
-        midi = (octave + 1) * 12 + semitones[deg] + int(accidental)
-        midi = max(36, min(96, midi))
-        if accidental > 0:
+
+        # 若無小節內臨時記號且非還原記號，自動套用調號預設升降
+        eff_acc = int(accidental)
+        if eff_acc == 0 and not show_natural and key_fifths != 0:
+            sharp_order = (3, 0, 4, 1, 5, 2, 6)  # F, C, G, D, A, E, B
+            flat_order = (6, 2, 5, 1, 4, 0, 3)   # B, E, A, D, G, C, F
+            f = max(-7, min(7, int(key_fifths)))
+            if f > 0 and deg in sharp_order[:f]:
+                eff_acc = 1
+            elif f < 0 and deg in flat_order[:-f]:
+                eff_acc = -1
+
+        midi = (octave + 1) * 12 + semitones[deg] + eff_acc
+        midi = max(21, min(108, midi))
+        if eff_acc > 0:
             acc_str = "#"
-        elif accidental < 0:
+        elif eff_acc < 0:
             acc_str = "b"
         elif show_natural:
             acc_str = "♮"
@@ -2700,3 +2953,15 @@ class ScoreAnalyzer:
         if acc_str == "♮":
             return midi, f"♮{names[deg]}{octave}"
         return midi, f"{names[deg]}{acc_str}{octave}"
+
+    @staticmethod
+    def _y_to_treble_pitch(
+        ny: float,
+        y_bot: float,
+        sp: float,
+        accidental: int = 0,
+        show_natural: bool = False,
+    ) -> Tuple[int, str]:
+        return ScoreAnalyzer._y_to_pitch(
+            ny, y_bot, sp, clef="treble", key_fifths=0, accidental=accidental, show_natural=show_natural
+        )

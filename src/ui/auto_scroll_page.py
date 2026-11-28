@@ -21,6 +21,10 @@ from PyQt6.QtGui import (
 from src.core.score_analyzer import (
     ScoreAnalyzer, ScoreAnalysis, PageAnalysis, StaffInfo, NoteEvent, PlaybackMeasure
 )
+from src.core.pdf_vector_analyzer import PDFVectorAnalyzer
+from src.core.symbolic_score_loader import (
+    SymbolicScoreLoader, SUPPORTED_SYMBOLIC_EXTS, format_key_signature_label
+)
 from src.core.note_synth import NoteSynthesizer
 
 
@@ -36,11 +40,13 @@ class ScorePageWidget(QWidget):
         self.setFixedSize(pixmap.size())
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        # 演奏游標狀態（歸一化座標 0.0~1.0）
+        # 演奏游標狀態（歸一化座標 0.0~1.0，支援鋼琴雙手大譜表同步高亮）
         self._active_staff: Optional[StaffInfo] = None
+        self._paired_staff: Optional[StaffInfo] = None
         self._cursor_x_norm: Optional[float] = None
         self._note_x_norm: Optional[float] = None
         self._note_y_norm: Optional[float] = None
+        self._active_note_pts: List[Tuple[float, float, bool]] = []
         self._is_rest: bool = False
         self._is_grace: bool = False
         self._repeat_pass: int = 1
@@ -73,12 +79,16 @@ class ScorePageWidget(QWidget):
         is_rest: bool = False,
         is_grace: bool = False,
         repeat_pass: int = 1,
+        paired_staff: Optional[StaffInfo] = None,
+        active_note_pts: Optional[List[Tuple[float, float, bool]]] = None,
     ):
         """更新本頁的演奏游標位置；若 staff 為 None 則清除本頁游標"""
         self._active_staff = staff
+        self._paired_staff = paired_staff
         self._cursor_x_norm = cursor_x_norm
         self._note_x_norm = note_x_norm
         self._note_y_norm = note_y_norm
+        self._active_note_pts = list(active_note_pts) if active_note_pts else []
         self._is_rest = is_rest
         self._is_grace = is_grace
         self._repeat_pass = repeat_pass
@@ -87,9 +97,11 @@ class ScorePageWidget(QWidget):
     def clear_playhead(self):
         if self._active_staff is not None or self._cursor_x_norm is not None:
             self._active_staff = None
+            self._paired_staff = None
             self._cursor_x_norm = None
             self._note_x_norm = None
             self._note_y_norm = None
+            self._active_note_pts = []
             self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -161,8 +173,20 @@ class ScorePageWidget(QWidget):
             painter.setBrush(QBrush(QColor(235, 160, 20, 185)))
             painter.drawRoundedRect(QRectF(staff_left, band_top_s, 4.0, band_h_s), 2.0, 2.0)
 
-        # 3b. 半透明垂直光條 + 紅色中心細線（隨游標所在 x 對齊該處五線譜上下高度）
+        # 3b. 半透明垂直光條 + 紅色中心細線（若為鋼琴雙手大譜表，紅線自動貫穿上下雙行！）
         c_yt_n, c_yb_n = st.y_range_at(self._cursor_x_norm)
+        if self._paired_staff is not None:
+            p_yt_n, p_yb_n = self._paired_staff.y_range_at(self._cursor_x_norm)
+            c_yt_n = min(c_yt_n, p_yt_n)
+            c_yb_n = max(c_yb_n, p_yb_n)
+            # 同步繪製配對下行淡黃底光
+            p_top = max(4.0, p_yt_n * h - pad_y)
+            p_bot = min(h - 4.0, p_yb_n * h + pad_y)
+            p_left = max(4.0, self._paired_staff.x_left_norm * w - sp_px * 0.8)
+            p_right = min(w - 4.0, self._paired_staff.x_right_norm * w + sp_px * 0.8)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(255, 224, 102, 48)))
+            painter.drawRoundedRect(QRectF(p_left, p_top, max(20.0, p_right - p_left), max(16.0, p_bot - p_top)), 6.0, 6.0)
         band_top = max(4.0, c_yt_n * h - pad_y)
         band_bot = min(h - 4.0, c_yb_n * h + pad_y)
         band_h = max(16.0, band_bot - band_top)
@@ -202,11 +226,14 @@ class ScorePageWidget(QWidget):
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(QRectF(bx_badge, by_badge, 48.0, 15.0), Qt.AlignmentFlag.AlignCenter, f"第{self._repeat_pass}遍")
 
-        # 3d. 目前播放音符柔和光圈（區分一般主音符與紫色小裝飾音）
-        if not self._is_rest and self._note_x_norm is not None and self._note_y_norm is not None:
-            nx = self._note_x_norm * w
-            ny = self._note_y_norm * h
-            if self._is_grace:
+        # 3d. 目前播放音符柔和光圈（支援雙手和弦多顆音符同時高亮）
+        pts_to_draw = self._active_note_pts
+        if not pts_to_draw and (not self._is_rest) and self._note_x_norm is not None and self._note_y_norm is not None:
+            pts_to_draw = [(self._note_x_norm, self._note_y_norm, self._is_grace)]
+        for px_n, py_n, pt_grace in pts_to_draw:
+            nx = px_n * w
+            ny = py_n * h
+            if pt_grace:
                 r = max(5.0, sp_px * 0.68)
                 painter.setPen(QPen(QColor(147, 51, 234, 230), 2.0))
                 painter.setBrush(QBrush(QColor(168, 85, 247, 75)))
@@ -354,10 +381,17 @@ class ScoreViewWidget(QWidget):
         is_rest: bool = False,
         is_grace: bool = False,
         repeat_pass: int = 1,
+        paired_staff: Optional[StaffInfo] = None,
+        active_note_pts: Optional[List[Tuple[float, float, bool]]] = None,
     ):
         for i, page_w in enumerate(self.page_labels):
             if i == page_index and staff is not None and cursor_x_norm is not None:
-                page_w.set_playhead(staff, cursor_x_norm, note_x_norm, note_y_norm, is_rest, is_grace, repeat_pass)
+                page_w.set_playhead(
+                    staff, cursor_x_norm, note_x_norm, note_y_norm,
+                    is_rest, is_grace, repeat_pass,
+                    paired_staff=paired_staff,
+                    active_note_pts=active_note_pts,
+                )
             else:
                 page_w.clear_playhead()
 
@@ -373,6 +407,7 @@ class AutoScrollPage(QWidget):
         "2/4": 2.0,
         "3/4": 3.0,
         "4/4": 4.0,
+        "2/2": 4.0,
         "6/8": 3.0,
     }
 
@@ -708,32 +743,51 @@ class AutoScrollPage(QWidget):
             self._analysis = None
             self._doc = None
 
-            if ext == ".pdf":
-                doc = fitz.open(file_path)
-            elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]:
-                img_doc = fitz.open(file_path)
-                pdf_bytes = img_doc.convert_to_pdf()
-                doc = fitz.open("pdf", pdf_bytes)
-                img_doc.close()
-            else:
-                QMessageBox.warning(self, "不支援的格式", f"未支援的樂譜檔案格式：{ext}\n請選擇 PDF 或圖片檔。")
-                return False
-
-            self._doc = doc
-            self._page_count = doc.page_count
             self._current_page = 0
             self._current_beat = 0.0
             self._stop_at_beat = None
             self._last_scrolled_staff = (-1, -1)
             self._last_played_event_idx = -1
 
-            # 1. 高解析渲染所有頁面
-            self._render_all_pages()
+            if SymbolicScoreLoader.is_symbolic_file(file_path):
+                # 原生載入 MusicXML (.musicxml/.xml/.mxl)、MuseScore (.mscz/.mscx) 或 MIDI (.mid/.midi)
+                rgb_pages, analysis = SymbolicScoreLoader.load(file_path)
+                self._doc = None
+                self._page_count = len(rgb_pages)
+                self._raw_rgb_pages = rgb_pages
+                self._analysis = analysis
+                for rgb in rgb_pages:
+                    rh, rw, _ = rgb.shape
+                    qimg = QImage(rgb.data, rw, rh, rw * 3, QImage.Format.Format_RGB888)
+                    pm = QPixmap.fromImage(qimg.copy())
+                    self._raw_pixmaps.append(pm)
+                    self._enhanced_pixmaps.append(pm)
+            else:
+                if ext == ".pdf":
+                    doc = fitz.open(file_path)
+                elif ext in [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"]:
+                    img_doc = fitz.open(file_path)
+                    pdf_bytes = img_doc.convert_to_pdf()
+                    doc = fitz.open("pdf", pdf_bytes)
+                    img_doc.close()
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "不支援的格式",
+                        f"未支援的樂譜檔案格式：{ext}\n支援 PDF、MuseScore (.mscz/.mscx)、MusicXML (.musicxml/.mxl/.xml)、MIDI (.mid/.midi) 與圖片檔。",
+                    )
+                    return False
 
-            # 2. 執行尺度不變 OpenCV OMR 結構分析
-            self._run_score_analysis()
+                self._doc = doc
+                self._page_count = doc.page_count
 
-            # 2b. 若樂譜上辨識到明確拍號（如 2/4）與速度標記（如 ♩ = 116），自動同步設定至工具列！
+                # 1. PDF 以 300 DPI 高解析渲染（純白向量 PDF 自動保留原字體抗鋸齒不套用翻拍濾鏡！）；一般圖片保持 150 DPI 避免雙重縮放
+                self._render_all_pages(is_pdf=(ext == ".pdf"))
+
+                # 2. 數位向量 PDF 優先讀取內嵌音樂字型座標，掃描 PDF/照片則執行 OpenCV OMR 分析
+                self._run_score_analysis(is_pdf=(ext == ".pdf"))
+
+            # 2b. 若樂譜上辨識到明確拍號（如 2/4、4/4、2/2）與速度標記（如 ♩ = 116），自動同步設定至工具列！
             auto_meta_tags = []
             if self._analysis:
                 det_ts = self._analysis.detected_time_sig
@@ -758,6 +812,11 @@ class AutoScrollPage(QWidget):
                     self.bpm_spin.setValue(det_bpm)
                     self.bpm_spin.blockSignals(False)
                     auto_meta_tags.append(f"速度 {det_bpm} BPM")
+
+                if self._analysis.detected_key_fifths != 0:
+                    auto_meta_tags.append(f"調號 {format_key_signature_label(self._analysis.detected_key_fifths)}")
+                if self._analysis.is_grand_staff:
+                    auto_meta_tags.append("鋼琴雙手大譜表")
 
             # 3. 預設自適應寬度呈現並顯示初始游標與第一音符校準資訊
             self._fit_to_width()
@@ -790,16 +849,21 @@ class AutoScrollPage(QWidget):
             QMessageBox.critical(self, "開啟失敗", f"無法解析樂譜檔案：\n{str(e)}")
             return False
 
-    def _render_all_pages(self):
+    def _render_all_pages(self, is_pdf: bool = True):
         if not self._doc:
             return
 
         self._raw_pixmaps.clear()
         self._enhanced_pixmaps.clear()
         self._raw_rgb_pages.clear()
-        zoom_matrix = fitz.Matrix(150 / 72, 150 / 72)
         for page_idx in range(self._page_count):
             page = self._doc[page_idx]
+            # 真實 PDF 以 300 DPI 高解析向量渲染（單頁寬度上限 3000px）；一般圖片檔維持原 150 DPI 避免雙重內插模糊
+            if is_pdf:
+                scale = min(300.0 / 72.0, 3000.0 / max(1.0, float(page.rect.width)))
+            else:
+                scale = 150.0 / 72.0
+            zoom_matrix = fitz.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=zoom_matrix, alpha=False)
             qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
             pm = QPixmap.fromImage(qimg.copy())
@@ -808,16 +872,30 @@ class AutoScrollPage(QWidget):
             rgb = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).copy()
             self._raw_rgb_pages.append(rgb)
 
-            enh_rgb = np.ascontiguousarray(ScoreAnalyzer.enhance_score_rgb(rgb))
-            eh, ew, _ = enh_rgb.shape
-            enh_qimg = QImage(enh_rgb.data, ew, eh, ew * 3, QImage.Format.Format_RGB888)
-            self._enhanced_pixmaps.append(QPixmap.fromImage(enh_qimg.copy()))
+            # 純白數位向量 PDF 保留原始抗鋸齒高清字體，僅泛黃/翻拍照片套用去底色增強濾鏡
+            if ScoreAnalyzer.is_clean_digital_page(rgb):
+                self._enhanced_pixmaps.append(pm)
+            else:
+                enh_rgb = np.ascontiguousarray(ScoreAnalyzer.enhance_score_rgb(rgb))
+                eh, ew, _ = enh_rgb.shape
+                enh_qimg = QImage(enh_rgb.data, ew, eh, ew * 3, QImage.Format.Format_RGB888)
+                self._enhanced_pixmaps.append(QPixmap.fromImage(enh_qimg.copy()))
 
-    def _run_score_analysis(self):
+    def _run_score_analysis(self, is_pdf: bool = False):
         if not self._raw_rgb_pages:
             self._analysis = None
             return
         try:
+            # 若為數位向量 PDF（如 MuseScore 匯出），優先解析內嵌向量音樂字型（100% 精準支援大譜表/調號/低音譜號）
+            if is_pdf and self._doc is not None:
+                vec_res = PDFVectorAnalyzer.analyze_pdf_document(
+                    self._doc,
+                    beats_per_measure=self._beats_per_measure,
+                    enable_repeats=self._enable_repeats,
+                )
+                if vec_res is not None and vec_res.has_staves:
+                    self._analysis = vec_res
+                    return
             self._analysis = self._analyzer.analyze_pages(
                 self._raw_rgb_pages,
                 beats_per_measure=self._beats_per_measure,
@@ -881,7 +959,9 @@ class AutoScrollPage(QWidget):
     def _on_open(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "開啟樂譜檔案", "",
-            "樂譜與圖片 (*.pdf *.jpg *.jpeg *.png *.webp *.bmp);;PDF 樂譜 (*.pdf);;圖片 (*.jpg *.jpeg *.png *.webp);;所有檔案 (*)"
+            "所有支援樂譜 (*.pdf *.mscz *.mscx *.musicxml *.xml *.mxl *.mid *.midi *.jpg *.jpeg *.png *.webp *.bmp);;"
+            "MuseScore / MusicXML / MIDI (*.mscz *.mscx *.musicxml *.xml *.mxl *.mid *.midi);;"
+            "PDF 樂譜 (*.pdf);;圖片 (*.jpg *.jpeg *.png *.webp *.bmp);;所有檔案 (*)"
         )
         if file_path:
             self.load_file(file_path)
@@ -908,7 +988,14 @@ class AutoScrollPage(QWidget):
             "QPushButton:hover { background-color: #a82e00; }"
         )
         self._scroll_subpixel = 0.0
+        # 計算起播拍點之前最後一個事件索引，避免中途起播重播前面小節，同時確保當前拍點雙手同時發聲
         self._last_played_event_idx = -1
+        if self._use_note_tracking() and self._analysis:
+            for k_i, ev_k in enumerate(self._analysis.events):
+                if ev_k.beat_offset < self._current_beat - 1e-3:
+                    self._last_played_event_idx = k_i
+                else:
+                    break
         self._last_tick_time = time.perf_counter()
         # 立即觸發當前音符發聲與畫面更新
         if self._use_note_tracking():
@@ -1101,28 +1188,40 @@ class AutoScrollPage(QWidget):
 
     def _find_event_at_beat(self, beat: float) -> Tuple[int, NoteEvent]:
         events = self._analysis.events
+        # 找到最後一個 beat_offset <= beat + 1e-4 的事件，再優先挑同拍點內右手（或非休止）事件作主游標
         lo, hi = 0, len(events) - 1
+        best = 0
         while lo <= hi:
             mid = (lo + hi) // 2
-            ev = events[mid]
-            if beat < ev.beat_offset:
-                hi = mid - 1
-            elif beat >= ev.beat_offset + ev.duration_beats:
+            if events[mid].beat_offset <= beat + 1e-4:
+                best = mid
                 lo = mid + 1
             else:
-                return mid, ev
-        idx = max(0, min(len(events) - 1, lo))
-        return idx, events[idx]
+                hi = mid - 1
+        # 若為大譜表且同一拍點包含右手與左手，優先回傳該拍點的右手音符（讓紅線順暢跟隨右手旋律推進）
+        target_b = events[best].beat_offset
+        cand = best
+        while cand > 0 and abs(events[cand - 1].beat_offset - target_b) <= 1e-3:
+            cand -= 1
+            if events[cand].hand != "LH" and not events[cand].is_rest:
+                return cand, events[cand]
+        return best, events[best]
 
     def _sync_playhead_visual(self, scroll_to_staff: bool = True):
-        """根據 _current_beat 計算游標位置、更新音符詳細校準面板，並於播放時發聲"""
+        """根據 _current_beat 計算游標位置、更新音符詳細校準面板，並於播放時雙手同步發聲"""
         if not self._analysis or not self._analysis.events:
             return
 
+        events = self._analysis.events
         idx, ev = self._find_event_at_beat(self._current_beat)
         staff = self._analysis.get_staff(ev.page_index, ev.staff_index)
         if staff is None:
             return
+        paired_staff = (
+            self._analysis.get_staff(ev.page_index, staff.paired_staff_index)
+            if staff.paired_staff_index is not None
+            else None
+        )
 
         frac = 0.0
         if ev.duration_beats > 1e-6:
@@ -1142,9 +1241,11 @@ class AutoScrollPage(QWidget):
             cursor_x = start_x + (end_x - start_x) * frac
         else:
             next_x = staff.x_right_norm
-            if idx + 1 < len(self._analysis.events):
-                nxt = self._analysis.events[idx + 1]
-                # 若下一音在同一行且在當前音右側，平滑插值至下一音；若遇到 :|| 反覆回跳左側或換行，則先推進至本小節右界
+            found_nxt = False
+            for j in range(idx + 1, min(len(events), idx + 12)):
+                nxt = events[j]
+                if nxt.beat_offset <= ev.beat_offset + 1e-4:
+                    continue
                 if (
                     nxt.page_index == ev.page_index
                     and nxt.staff_index == ev.staff_index
@@ -1152,12 +1253,29 @@ class AutoScrollPage(QWidget):
                     and nxt.repeat_pass == ev.repeat_pass
                 ):
                     next_x = nxt.x_norm
-                else:
-                    for m in staff.measures:
-                        if m.measure_number == ev.measure_number:
-                            next_x = m.x_end_norm
-                            break
+                    found_nxt = True
+                break
+            if not found_nxt:
+                for m in staff.measures:
+                    if m.measure_number == ev.measure_number:
+                        next_x = m.x_end_norm
+                        break
             cursor_x = ev.x_norm + (next_x - ev.x_norm) * frac
+
+        # 蒐集本拍點雙手同時發聲的所有音符座標（供大譜表同時雙手高亮光圈！）
+        active_pts: List[Tuple[float, float, bool]] = []
+        win_lo = max(0, idx - 6)
+        win_hi = min(len(events), idx + 8)
+        for k_a in range(win_lo, win_hi):
+            ev_a = events[k_a]
+            if ev_a.page_index != ev.page_index or ev_a.is_rest:
+                continue
+            if ev_a.beat_offset - 1e-3 <= self._current_beat < (ev_a.beat_offset + max(0.05, ev_a.duration_beats)):
+                if ev_a.note_ys_norm:
+                    for yn_v in ev_a.note_ys_norm:
+                        active_pts.append((ev_a.x_norm, yn_v, ev_a.is_grace))
+                else:
+                    active_pts.append((ev_a.x_norm, ev_a.y_norm, ev_a.is_grace))
 
         self.score_view.update_playhead(
             page_index=ev.page_index,
@@ -1168,6 +1286,8 @@ class AutoScrollPage(QWidget):
             is_rest=ev.is_rest,
             is_grace=ev.is_grace,
             repeat_pass=ev.repeat_pass,
+            paired_staff=paired_staff,
+            active_note_pts=active_pts,
         )
 
         # 組裝反覆記號狀態標籤
@@ -1185,6 +1305,7 @@ class AutoScrollPage(QWidget):
             rep_detail += f" (目前第 {ev.repeat_pass} 遍)"
 
         # 更新左上徽章與音符校準詳細資訊列
+        hand_badge = f"[{ev.hand}] " if ev.hand else ""
         if ev.is_rest:
             m_range = (
                 f"{ev.measure_number}~{ev.measure_number + ev.rest_measures - 1}"
@@ -1192,42 +1313,55 @@ class AutoScrollPage(QWidget):
             )
             self.measure_label.setText(f"小節：{m_range} / {self._analysis.total_measures}{pass_badge}  ({ev.note_type})")
             self.note_detail_label.setText(
-                f"🔎 事件 #{ev.event_index}/{len(self._analysis.events)}  |  "
-                f"第 {ev.staff_index + 1} 行 • 第 {m_range} 小節 (第 1/1 個事件)  |  "
+                f"🔎 事件 #{ev.event_index}/{len(events)}  |  "
+                f"{hand_badge}第 {ev.staff_index + 1} 行 • 第 {m_range} 小節 (第 1/1 個事件)  |  "
                 f"類型：【{ev.note_type}】  |  音高：靜音 (Rest)  |  "
                 f"時值：{ev.duration_beats:.2f} 拍 (起始 {ev.beat_offset:.2f} 拍){rep_detail}"
             )
         else:
             rep_sym = "||: " if (ev.repeat_start and ev.note_index_in_measure == 1) else ""
             self.measure_label.setText(
-                f"小節：{rep_sym}{ev.measure_number} / {self._analysis.total_measures}{pass_badge}  ♪ {ev.note_name}"
+                f"小節：{rep_sym}{ev.measure_number} / {self._analysis.total_measures}{pass_badge}  ♪ {hand_badge}{ev.note_name}"
             )
             self.note_detail_label.setText(
-                f"🔎 事件 #{ev.event_index}/{len(self._analysis.events)}  |  "
-                f"第 {ev.staff_index + 1} 行 • 第 {ev.measure_number} 小節 "
+                f"🔎 事件 #{ev.event_index}/{len(events)}  |  "
+                f"{hand_badge}第 {ev.staff_index + 1} 行 • 第 {ev.measure_number} 小節 "
                 f"第 {ev.note_index_in_measure}/{ev.notes_in_measure} 個音符  |  "
                 f"類型：【{ev.note_type}】  |  "
                 f"音高：{ev.note_name} (MIDI {ev.midi_note} • {ev.freq_hz:.1f} Hz)  |  "
                 f"時長：{ev.duration_beats:.2f} 拍 (橫槓={ev.beam_count}){rep_detail}"
             )
 
-        # 連續播放中進入新音符時發聲（依保持音 / 跳音記號微調發聲長度比例）
-        if self._is_playing and idx != self._last_played_event_idx:
-            self._last_played_event_idx = idx
-            if not ev.is_rest and ev.midi_note > 0:
-                beats_per_sec = max(0.2, (self._bpm / 60.0) * self._scroll_speed)
-                if "跳音" in ev.articulation:
-                    gate = 0.48
-                elif "保持音" in ev.articulation or "延長記號" in ev.articulation:
-                    gate = 0.99
-                else:
-                    gate = 0.92
-                dur_sec = max(0.08, (ev.duration_beats / beats_per_sec) * gate)
-                self._synth.play_note(ev.midi_note, duration_sec=dur_sec)
-            else:
+        # 連續播放中：一次觸發所有 beat_offset <= _current_beat 的未發聲事件（完整支援鋼琴雙手同步與多音和弦！）
+        if self._is_playing:
+            beats_per_sec = max(0.2, (self._bpm / 60.0) * self._scroll_speed)
+            next_k = self._last_played_event_idx + 1
+            triggered_any_note = False
+            saw_rest_only = False
+            while next_k < len(events) and events[next_k].beat_offset <= self._current_beat + 1e-4:
+                ev_k = events[next_k]
+                self._last_played_event_idx = next_k
+                mids = ev_k.all_midi_notes
+                if mids:
+                    if "跳音" in ev_k.articulation:
+                        gate = 0.48
+                    elif "保持音" in ev_k.articulation or "延長記號" in ev_k.articulation:
+                        gate = 0.99
+                    else:
+                        gate = 0.94
+                    dur_sec = max(0.08, (ev_k.duration_beats / beats_per_sec) * gate)
+                    if len(mids) > 1:
+                        self._synth.play_chord(mids, duration_sec=dur_sec)
+                    else:
+                        self._synth.play_note(mids[0], duration_sec=dur_sec)
+                    triggered_any_note = True
+                elif ev_k.is_rest and not self._analysis.is_grand_staff:
+                    saw_rest_only = True
+                next_k += 1
+            if saw_rest_only and not triggered_any_note:
                 self._synth.stop_all()
 
-        staff_key = (ev.page_index, ev.staff_index)
+        staff_key = (ev.page_index, staff.system_index if staff.system_index >= 0 else ev.staff_index)
         if scroll_to_staff and staff_key != self._last_scrolled_staff:
             self._last_scrolled_staff = staff_key
             self._scroll_to_staff(ev.page_index, staff)
