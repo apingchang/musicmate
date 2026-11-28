@@ -134,11 +134,20 @@ class _SymEvent:
 
 
 @dataclass
+class _SymPart:
+    name: str = ""
+    clef: str = "treble"
+    hand: str = ""
+    timbre: str = ""
+
+
+@dataclass
 class _SymMeasure:
     measure_number: int
     duration_beats: float
     rh_events: List[_SymEvent] = field(default_factory=list)
     lh_events: List[_SymEvent] = field(default_factory=list)
+    part_events: List[List[_SymEvent]] = field(default_factory=list)
 
 
 @dataclass
@@ -150,7 +159,33 @@ class _SymScore:
     bpm: int = 96
     key_fifths: int = 0
     is_grand_staff: bool = False
+    parts: List[_SymPart] = field(default_factory=list)
     measures: List[_SymMeasure] = field(default_factory=list)
+
+
+def _guess_instrument_timbre(part_name: str) -> str:
+    """依樂器聲部名稱自動對應內建 SoundFont 真實樂器音色"""
+    low = (part_name or "").lower()
+    mapping = (
+        ("violin", "小提琴"), ("小提琴", "小提琴"),
+        ("cello", "大提琴"), ("violoncello", "大提琴"), ("大提琴", "大提琴"),
+        ("contrabass", "低音提琴"), ("double bass", "低音提琴"), ("低音提琴", "低音提琴"),
+        ("flute", "長笛"), ("長笛", "長笛"),
+        ("clarinet", "豎笛"), ("豎笛", "豎笛"), ("單簧管", "豎笛"),
+        ("oboe", "雙簧管"), ("雙簧管", "雙簧管"),
+        ("bassoon", "低音管"), ("低音管", "低音管"),
+        ("sax", "薩克斯風"), ("薩克斯", "薩克斯風"),
+        ("trumpet", "小號"), ("小號", "小號"),
+        ("horn", "法國號"), ("法國號", "法國號"),
+        ("organ", "管風琴"), ("管風琴", "管風琴"),
+        ("marimba", "馬林巴"), ("馬林巴", "馬林巴"),
+        ("timpani", "定音鼓"), ("定音鼓", "定音鼓"),
+        ("piano", "鋼琴"), ("鋼琴", "鋼琴"),
+    )
+    for kw, zh in mapping:
+        if kw in low:
+            return zh
+    return ""
 
 
 def _duration_to_meta(dur_beats: float, is_rest: bool = False, is_grace: bool = False) -> Tuple[str, bool, int, bool]:
@@ -279,16 +314,41 @@ class SymbolicScoreLoader:
         parts = list(score.parts)
         if not parts:
             parts = [score]
+        parts = parts[:8]  # 單系統上限 8 行確保 A4 譜面清晰可讀
 
-        # 判斷是否為鋼琴雙手大譜表（2 個以上 Part 或單一 Part 含 Staff 1/2）
-        is_grand = len(parts) >= 2
-        rh_part = parts[0]
-        lh_part = parts[1] if len(parts) >= 2 else None
-        sym.is_grand_staff = is_grand
+        n_parts = len(parts)
+        sym.is_grand_staff = n_parts >= 2
 
-        rh_measures = list(rh_part.getElementsByClass(music21.stream.Measure))
-        lh_measures = list(lh_part.getElementsByClass(music21.stream.Measure)) if lh_part is not None else []
-        n_m = max(len(rh_measures), len(lh_measures))
+        # 偵測各聲部名稱、譜號與樂器音色（支援 2 行鋼琴大譜表及 3~8 行多種樂器重奏總譜！）
+        raw_part_names = [str(getattr(pt, "partName", "") or "").strip() for pt in parts]
+        is_piano_two = (
+            n_parts == 2
+            and (
+                not any(raw_part_names)
+                or all(("piano" in nm.lower() or "rh" in nm.lower() or "lh" in nm.lower() or "鋼琴" in nm or nm == "") for nm in raw_part_names)
+            )
+        )
+        sym_parts: List[_SymPart] = []
+        part_measures_list: List[list] = []
+        for p_i, pt in enumerate(parts):
+            ms_p = list(pt.getElementsByClass(music21.stream.Measure))
+            part_measures_list.append(ms_p)
+            clefs_p = list(pt.recurse().getElementsByClass(music21.clef.Clef))
+            clef_str = "bass" if (clefs_p and "Bass" in clefs_p[0].name) else ("bass" if (is_piano_two and p_i == 1) else "treble")
+            if n_parts == 1:
+                p_name, h_tag, imb = raw_part_names[0], "", _guess_instrument_timbre(raw_part_names[0])
+            elif is_piano_two:
+                p_name = "右手 RH" if p_i == 0 else "左手 LH"
+                h_tag = "RH" if p_i == 0 else "LH"
+                imb = "鋼琴"
+            else:
+                p_name = raw_part_names[p_i] or f"樂器 {p_i + 1}"
+                h_tag = f"P{p_i + 1}"
+                imb = _guess_instrument_timbre(p_name)
+            sym_parts.append(_SymPart(name=p_name, clef=clef_str, hand=h_tag, timbre=imb))
+        sym.parts = sym_parts
+
+        n_m = max((len(ml) for ml in part_measures_list), default=0)
 
         def extract_measure_events(m_obj) -> List[_SymEvent]:
             if m_obj is None:
@@ -320,17 +380,21 @@ class SymbolicScoreLoader:
 
         if n_m > 0:
             for idx in range(n_m):
-                rm = rh_measures[idx] if idx < len(rh_measures) else None
-                lm = lh_measures[idx] if idx < len(lh_measures) else None
+                p_evs_per_part = [
+                    extract_measure_events(part_measures_list[p_i][idx] if idx < len(part_measures_list[p_i]) else None)
+                    for p_i in range(n_parts)
+                ]
                 m_dur = sym.beats_per_measure
-                if rm is not None and float(rm.barDuration.quarterLength) > 0:
-                    m_dur = float(rm.barDuration.quarterLength)
+                rm0 = part_measures_list[0][idx] if idx < len(part_measures_list[0]) else None
+                if rm0 is not None and float(rm0.barDuration.quarterLength) > 0:
+                    m_dur = float(rm0.barDuration.quarterLength)
                 sym.measures.append(
                     _SymMeasure(
                         measure_number=idx + 1,
                         duration_beats=m_dur,
-                        rh_events=extract_measure_events(rm),
-                        lh_events=extract_measure_events(lm) if is_grand else [],
+                        rh_events=p_evs_per_part[0] if n_parts >= 1 else [],
+                        lh_events=p_evs_per_part[1] if n_parts >= 2 else [],
+                        part_events=p_evs_per_part,
                     )
                 )
         else:
@@ -653,16 +717,54 @@ class SymbolicScoreLoader:
                 out_measures.append(_merge_simultaneous_events(m_evs))
             return out_measures
 
-        rh_list = parse_staff_measures(music_staves[0], is_primary=True)
-        lh_list = parse_staff_measures(music_staves[1], is_primary=False) if sym.is_grand_staff else []
-        n_m = max(len(rh_list), len(lh_list))
+        # 讀取 <Part> 宣告的樂器名稱與多行總譜（相容 1 行獨奏、2 行鋼琴與 3~8 行重奏總譜）
+        staff_part_names: List[str] = []
+        for p_el in score_el.findall("Part"):
+            t_name = (p_el.findtext("trackName") or p_el.findtext("Instrument/longName") or "").strip()
+            n_st_in_p = max(1, len(p_el.findall("Staff")))
+            for k_sp in range(n_st_in_p):
+                staff_part_names.append(t_name)
+
+        use_staves = music_staves[:8]
+        n_st = len(use_staves)
+        sym.is_grand_staff = n_st >= 2
+        all_staff_lists = [parse_staff_measures(st_e, is_primary=(i == 0)) for i, st_e in enumerate(use_staves)]
+        is_piano_two = (
+            n_st == 2
+            and (
+                not any(staff_part_names[:2])
+                or all(("piano" in nm.lower() or "鋼琴" in nm or nm == "") for nm in staff_part_names[:2])
+            )
+        )
+        sym.parts = []
+        for p_i in range(n_st):
+            raw_nm = staff_part_names[p_i] if p_i < len(staff_part_names) else ""
+            if n_st == 1:
+                p_name, h_tag, clef_s, imb = raw_nm, "", "treble", _guess_instrument_timbre(raw_nm)
+            elif is_piano_two:
+                p_name = "右手 RH" if p_i == 0 else "左手 LH"
+                h_tag = "RH" if p_i == 0 else "LH"
+                clef_s = "treble" if p_i == 0 else "bass"
+                imb = "鋼琴"
+            else:
+                p_name = raw_nm or f"樂器 {p_i + 1}"
+                h_tag = f"P{p_i + 1}"
+                # 依該聲部平均音高自動選高音或低音譜號
+                p_mids = [m for ms in all_staff_lists[p_i] for ev in ms for m in ev.midi_notes]
+                clef_s = "bass" if (p_mids and float(np.mean(p_mids)) < 57.0) else "treble"
+                imb = _guess_instrument_timbre(p_name)
+            sym.parts.append(_SymPart(name=p_name, clef=clef_s, hand=h_tag, timbre=imb))
+
+        n_m = max((len(lst) for lst in all_staff_lists), default=0)
         for i in range(n_m):
+            pe = [all_staff_lists[p_i][i] if i < len(all_staff_lists[p_i]) else [] for p_i in range(n_st)]
             sym.measures.append(
                 _SymMeasure(
                     measure_number=i + 1,
                     duration_beats=sym.beats_per_measure,
-                    rh_events=rh_list[i] if i < len(rh_list) else [],
-                    lh_events=lh_list[i] if i < len(lh_list) else [],
+                    rh_events=pe[0] if n_st >= 1 else [],
+                    lh_events=pe[1] if n_st >= 2 else [],
+                    part_events=pe,
                 )
             )
         return sym
@@ -673,15 +775,34 @@ class SymbolicScoreLoader:
     @classmethod
     def _render_and_build_analysis(cls, sym: _SymScore, source_format: str) -> Tuple[List[np.ndarray], ScoreAnalysis]:
         W, H = cls.PAGE_W, cls.PAGE_H
-        sp = 18.0
-        staff_h = 4.0 * sp
-        grand_gap = 7.2 * sp
-        margin_l = 125.0
-        margin_r = 75.0
-        usable_w = W - margin_l - margin_r
+        # 若未建立 sym.parts（例如 MIDI 單/雙軌），自動補齊標準 1 行或 2 行鋼琴聲部定義
+        if not sym.parts:
+            if sym.is_grand_staff:
+                sym.parts = [
+                    _SymPart(name="右手 RH", clef="treble", hand="RH", timbre="鋼琴"),
+                    _SymPart(name="左手 LH", clef="bass", hand="LH", timbre="鋼琴"),
+                ]
+            else:
+                sym.parts = [_SymPart(name="", clef="treble", hand="", timbre="")]
 
-        # 依平均每小節音數決定每行放 3 或 4 小節（如《月光奏鳴曲》每小節 12 個三連音 -> 3 小節最寬敞清晰）
-        avg_notes = float(np.mean([max(len(m.rh_events), len(m.lh_events), 1) for m in sym.measures]))
+        n_parts = len(sym.parts)
+        sp = 18.0 if n_parts <= 2 else (15.5 if n_parts <= 4 else 13.0)
+        staff_h = 4.0 * sp
+        staff_gap = 7.0 * sp if n_parts == 2 else 5.2 * sp
+        sys_block_h = n_parts * staff_h + max(0, n_parts - 1) * staff_gap
+        margin_l = 155.0 if n_parts >= 3 else 125.0
+        margin_r = 75.0
+
+        def get_part_events(sm: _SymMeasure, p_idx: int) -> List[_SymEvent]:
+            if sm.part_events and p_idx < len(sm.part_events):
+                return sm.part_events[p_idx]
+            if p_idx == 0:
+                return sm.rh_events
+            if p_idx == 1:
+                return sm.lh_events
+            return []
+
+        avg_notes = float(np.mean([max([len(get_part_events(m, pi)) for pi in range(n_parts)] + [1]) for m in sym.measures]))
         measures_per_sys = 3 if avg_notes >= 9 else 4
 
         systems: List[List[_SymMeasure]] = [
@@ -689,8 +810,9 @@ class SymbolicScoreLoader:
             for i in range(0, len(sym.measures), measures_per_sys)
         ]
 
-        sys_per_page_p1 = 4 if sym.is_grand_staff else 6
-        sys_per_page_pn = 5 if sym.is_grand_staff else 7
+        sys_pitch_base = sys_block_h + (160.0 if n_parts <= 2 else 135.0)
+        sys_per_page_p1 = max(1, int((H - 270.0) // sys_pitch_base))
+        sys_per_page_pn = max(1, int((H - 180.0) // sys_pitch_base))
 
         pages_systems: List[List[List[_SymMeasure]]] = []
         idx_s = 0
@@ -705,7 +827,7 @@ class SymbolicScoreLoader:
             detected_time_sig=sym.time_sig,
             detected_bpm=sym.bpm,
             detected_key_fifths=sym.key_fifths,
-            is_grand_staff=sym.is_grand_staff,
+            is_grand_staff=(n_parts >= 2),
             source_format=source_format,
         )
         rgb_pages: List[np.ndarray] = []
@@ -721,7 +843,6 @@ class SymbolicScoreLoader:
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
 
-            # 第一頁頂部標題、作曲家、調號與速度標示
             if page_idx == 0:
                 title_font = QFont("Serif", 26)
                 title_font.setBold(True)
@@ -734,13 +855,10 @@ class SymbolicScoreLoader:
                 p.setPen(QColor(70, 78, 90))
                 meta_line = f"{sym.composer + '   |   ' if sym.composer else ''}{format_key_signature_label(sym.key_fifths)}   •   拍號 {sym.time_sig}   •   ♩ = {sym.bpm}"
                 p.drawText(QRectF(80, 118, W - 160, 32), Qt.AlignmentFlag.AlignCenter, meta_line)
-                y_start = 225.0
-                sys_pitch = 470.0 if sym.is_grand_staff else 325.0
+                y_start = 220.0
             else:
-                y_start = 130.0
-                sys_pitch = 425.0 if sym.is_grand_staff else 295.0
+                y_start = 120.0
 
-            # 頁碼
             pg_font = QFont("Serif", 11)
             p.setFont(pg_font)
             p.setPen(QColor(110, 115, 125))
@@ -754,146 +872,117 @@ class SymbolicScoreLoader:
                 detected_time_sig=sym.time_sig,
                 detected_bpm=sym.bpm,
                 detected_key_fifths=sym.key_fifths,
-                is_grand_staff=sym.is_grand_staff,
+                is_grand_staff=(n_parts >= 2),
             )
 
             for local_s_idx, sys_measures in enumerate(page_sys_list):
-                sy_rh_top = y_start + local_s_idx * sys_pitch
-                sy_rh_bot = sy_rh_top + staff_h
-                sy_lh_top = sy_rh_top + staff_h + grand_gap
-                sy_lh_bot = sy_lh_top + staff_h
+                sys_top_y = y_start + local_s_idx * sys_pitch_base
+                part_y_tops = [sys_top_y + pi * (staff_h + staff_gap) for pi in range(n_parts)]
+                part_y_bots = [yt + staff_h for yt in part_y_tops]
+                sys_bot_y = part_y_bots[-1]
 
-                rh_staff_idx = len(page_res.staves)
-                lh_staff_idx = rh_staff_idx + 1 if sym.is_grand_staff else None
+                base_staff_idx = len(page_res.staves)
+                sys_staff_indices = [base_staff_idx + pi for pi in range(n_parts)]
 
-                # 繪製五線譜橫線
-                line_pen = QPen(QColor(35, 38, 45), 1.6)
-                p.setPen(line_pen)
-                for k in range(5):
-                    y_r = sy_rh_top + k * sp
-                    p.drawLine(QPointF(margin_l, y_r), QPointF(W - margin_r, y_r))
-                    if sym.is_grand_staff:
-                        y_l = sy_lh_top + k * sp
-                        p.drawLine(QPointF(margin_l, y_l), QPointF(W - margin_r, y_l))
+                # 繪製各行五線譜橫線與左側樂器名稱
+                line_pen = QPen(QColor(35, 38, 45), 1.5)
+                part_font = QFont("Sans Serif", 10)
+                part_font.setBold(True)
+                for pi in range(n_parts):
+                    p.setPen(line_pen)
+                    for k in range(5):
+                        yk = part_y_tops[pi] + k * sp
+                        p.drawLine(QPointF(margin_l, yk), QPointF(W - margin_r, yk))
+                    if n_parts >= 3 and sym.parts[pi].name:
+                        p.setFont(part_font)
+                        p.setPen(QColor(45, 55, 72))
+                        p.drawText(
+                            QRectF(12.0, part_y_tops[pi], margin_l - 28.0, staff_h),
+                            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                            sym.parts[pi].name[:12],
+                        )
 
-                # 左端系統直線與鋼琴大括弧 '{'
+                # 左端系統貫穿直線與大括弧
                 p.setPen(QPen(QColor(20, 22, 26), 2.4))
-                if sym.is_grand_staff:
-                    p.drawLine(QPointF(margin_l, sy_rh_top), QPointF(margin_l, sy_lh_bot))
-                    cls._draw_grand_brace(p, margin_l - 10.0, sy_rh_top, sy_lh_bot)
-                else:
-                    p.drawLine(QPointF(margin_l, sy_rh_top), QPointF(margin_l, sy_rh_bot))
+                p.drawLine(QPointF(margin_l, part_y_tops[0]), QPointF(margin_l, sys_bot_y))
+                if n_parts >= 2:
+                    cls._draw_grand_brace(p, margin_l - 10.0, part_y_tops[0], sys_bot_y)
 
-                # 繪製譜號、調號與拍號
-                header_w = cls._draw_staff_header(
-                    p, margin_l, sy_rh_top, sp, "treble", sym.key_fifths,
-                    sym.time_sig if (page_idx == 0 and local_s_idx == 0) else None,
-                )
-                if sym.is_grand_staff:
-                    cls._draw_staff_header(
-                        p, margin_l, sy_lh_top, sp, "bass", sym.key_fifths,
+                # 繪製每行譜頭（譜號、調號、拍號）
+                header_w = 0.0
+                for pi in range(n_parts):
+                    hw_i = cls._draw_staff_header(
+                        p, margin_l, part_y_tops[pi], sp, sym.parts[pi].clef, sym.key_fifths,
                         sym.time_sig if (page_idx == 0 and local_s_idx == 0) else None,
                     )
+                    header_w = max(header_w, hw_i)
 
                 content_x0 = margin_l + header_w
                 content_w = (W - margin_r) - content_x0
                 m_w = content_w / max(1, len(sys_measures))
 
-                rh_staff = StaffInfo(
-                    page_index=page_idx,
-                    staff_index=rh_staff_idx,
-                    y_top_norm=sy_rh_top / H,
-                    y_bot_norm=sy_rh_bot / H,
-                    x_left_norm=margin_l / W,
-                    x_right_norm=(W - margin_r) / W,
-                    spacing_norm=sp / H,
-                    clef="treble",
-                    key_fifths=sym.key_fifths,
-                    system_index=sys_global_idx,
-                    paired_staff_index=lh_staff_idx,
-                )
-                lh_staff = (
-                    StaffInfo(
-                        page_index=page_idx,
-                        staff_index=lh_staff_idx,
-                        y_top_norm=sy_lh_top / H,
-                        y_bot_norm=sy_lh_bot / H,
-                        x_left_norm=margin_l / W,
-                        x_right_norm=(W - margin_r) / W,
-                        spacing_norm=sp / H,
-                        clef="bass",
-                        key_fifths=sym.key_fifths,
-                        system_index=sys_global_idx,
-                        paired_staff_index=rh_staff_idx,
+                sys_staves: List[StaffInfo] = []
+                for pi in range(n_parts):
+                    st_i = base_staff_idx + pi
+                    pair_idx = (base_staff_idx + 1 if pi == 0 else base_staff_idx) if n_parts == 2 else None
+                    sys_staves.append(
+                        StaffInfo(
+                            page_index=page_idx,
+                            staff_index=st_i,
+                            y_top_norm=part_y_tops[pi] / H,
+                            y_bot_norm=part_y_bots[pi] / H,
+                            x_left_norm=margin_l / W,
+                            x_right_norm=(W - margin_r) / W,
+                            spacing_norm=sp / H,
+                            clef=sym.parts[pi].clef,
+                            key_fifths=sym.key_fifths,
+                            system_index=sys_global_idx,
+                            paired_staff_index=pair_idx,
+                            system_staff_indices=list(sys_staff_indices),
+                            part_name=sym.parts[pi].name,
+                            instrument_timbre=sym.parts[pi].timbre,
+                        )
                     )
-                    if sym.is_grand_staff and lh_staff_idx is not None
-                    else None
-                )
 
                 for m_pos, sm in enumerate(sys_measures):
                     mx1 = content_x0 + m_pos * m_w
                     mx2 = mx1 + m_w
-                    # 小節號
                     mn_font = QFont("Sans Serif", 9)
                     p.setFont(mn_font)
                     p.setPen(QColor(95, 102, 115))
-                    p.drawText(QPointF(mx1 + 4.0, sy_rh_top - 12.0), str(sm.measure_number))
+                    p.drawText(QPointF(mx1 + 4.0, part_y_tops[0] - 12.0), str(sm.measure_number))
 
-                    # 右側小節線（大譜表貫穿雙行）
                     p.setPen(QPen(QColor(25, 28, 34), 1.8))
-                    if sym.is_grand_staff:
-                        p.drawLine(QPointF(mx2, sy_rh_top), QPointF(mx2, sy_lh_bot))
-                    else:
-                        p.drawLine(QPointF(mx2, sy_rh_top), QPointF(mx2, sy_rh_bot))
-                    rh_staff.barlines_norm.append(mx2 / W)
-                    if lh_staff is not None:
-                        lh_staff.barlines_norm.append(mx2 / W)
+                    p.drawLine(QPointF(mx2, part_y_tops[0]), QPointF(mx2, sys_bot_y))
+                    for st_obj in sys_staves:
+                        st_obj.barlines_norm.append(mx2 / W)
 
                     m_beat_start = cur_beat
                     m_beat_end = cur_beat + sm.duration_beats
-                    m_rh_info = MeasureInfo(
-                        page_index=page_idx,
-                        staff_index=rh_staff_idx,
-                        measure_number=sm.measure_number,
-                        x_start_norm=mx1 / W,
-                        x_end_norm=mx2 / W,
-                        y_top_norm=sy_rh_top / H,
-                        y_bot_norm=sy_rh_bot / H,
-                        beat_start=m_beat_start,
-                        beat_end=m_beat_end,
-                    )
-                    m_lh_info = (
-                        MeasureInfo(
+                    pad_x = min(26.0, m_w * 0.08)
+                    usable_mw = max(20.0, m_w - 2.0 * pad_x)
+                    combined_m: List[NoteEvent] = []
+                    lead_m_info = None
+
+                    for pi in range(n_parts):
+                        st_obj = sys_staves[pi]
+                        part_meta = sym.parts[pi]
+                        sy_top, sy_bot = part_y_tops[pi], part_y_bots[pi]
+                        m_info = MeasureInfo(
                             page_index=page_idx,
-                            staff_index=lh_staff_idx,
+                            staff_index=st_obj.staff_index,
                             measure_number=sm.measure_number,
                             x_start_norm=mx1 / W,
                             x_end_norm=mx2 / W,
-                            y_top_norm=sy_lh_top / H,
-                            y_bot_norm=sy_lh_bot / H,
+                            y_top_norm=sy_top / H,
+                            y_bot_norm=sy_bot / H,
                             beat_start=m_beat_start,
                             beat_end=m_beat_end,
                         )
-                        if lh_staff is not None and lh_staff_idx is not None
-                        else None
-                    )
-
-                    # 依小節內拍點將音符均勻映射至 [mx1 + pad, mx2 - pad]
-                    pad_x = min(26.0, m_w * 0.08)
-                    usable_mw = max(20.0, m_w - 2.0 * pad_x)
-
-                    def render_hand_events(
-                        ev_list: List[_SymEvent],
-                        sy_top: float,
-                        sy_bot: float,
-                        clef_name: str,
-                        st_idx: int,
-                        hand_tag: str,
-                        m_info: MeasureInfo,
-                    ) -> List[NoteEvent]:
-                        built: List[NoteEvent] = []
+                        if lead_m_info is None:
+                            lead_m_info = m_info
+                        ev_list = get_part_events(sm, pi)
                         if not ev_list:
-                            # 繪製整小節休止塊
                             cx = 0.5 * (mx1 + mx2)
                             cy = sy_top + sp * 1.25
                             p.setPen(Qt.PenStyle.NoPen)
@@ -902,7 +991,7 @@ class SymbolicScoreLoader:
                             ne = NoteEvent(
                                 event_index=0,
                                 page_index=page_idx,
-                                staff_index=st_idx,
+                                staff_index=st_obj.staff_index,
                                 measure_number=sm.measure_number,
                                 note_index_in_measure=1,
                                 notes_in_measure=1,
@@ -914,112 +1003,106 @@ class SymbolicScoreLoader:
                                 rest_measures=1,
                                 note_name="整小節休止",
                                 note_type="整小節休止",
-                                clef=clef_name,
-                                hand=hand_tag,
+                                clef=part_meta.clef,
+                                hand=part_meta.hand,
                                 system_index=sys_global_idx,
+                                part_name=part_meta.name,
+                                instrument_timbre=part_meta.timbre,
                             )
                             m_info.notes.append(ne)
-                            built.append(ne)
-                            return built
+                            combined_m.append(ne)
+                        else:
+                            total_e = len(ev_list)
+                            for k_i, se in enumerate(ev_list, start=1):
+                                frac_b = max(0.0, min(0.95, se.local_beat / max(0.25, sm.duration_beats)))
+                                nx = mx1 + pad_x + frac_b * usable_mw
+                                n_type, is_hollow, beams, is_dot = _duration_to_meta(se.duration_beats, se.is_rest, se.is_grace)
+                                if se.is_rest or not se.midi_notes:
+                                    cy = sy_top + 2.0 * sp
+                                    cls._draw_rest(p, nx, sy_top, sp, se.duration_beats)
+                                    ne = NoteEvent(
+                                        event_index=0,
+                                        page_index=page_idx,
+                                        staff_index=st_obj.staff_index,
+                                        measure_number=sm.measure_number,
+                                        note_index_in_measure=k_i,
+                                        notes_in_measure=total_e,
+                                        x_norm=nx / W,
+                                        y_norm=cy / H,
+                                        beat_offset=m_beat_start + se.local_beat,
+                                        duration_beats=se.duration_beats,
+                                        is_rest=True,
+                                        note_name="休止",
+                                        note_type=n_type,
+                                        clef=part_meta.clef,
+                                        hand=part_meta.hand,
+                                        system_index=sys_global_idx,
+                                        part_name=part_meta.name,
+                                        instrument_timbre=part_meta.timbre,
+                                    )
+                                    m_info.notes.append(ne)
+                                    combined_m.append(ne)
+                                    continue
 
-                        total_e = len(ev_list)
-                        for k_i, se in enumerate(ev_list, start=1):
-                            frac_b = max(0.0, min(0.95, se.local_beat / max(0.25, sm.duration_beats)))
-                            nx = mx1 + pad_x + frac_b * usable_mw
-                            n_type, is_hollow, beams, is_dot = _duration_to_meta(se.duration_beats, se.is_rest, se.is_grace)
-                            if se.is_rest or not se.midi_notes:
-                                cy = sy_top + 2.0 * sp
-                                cls._draw_rest(p, nx, sy_top, sp, se.duration_beats)
+                                ys_px: List[float] = []
+                                names: List[str] = []
+                                for mv in se.midi_notes:
+                                    step, disp_acc = midi_to_staff_step(mv, part_meta.clef, sym.key_fifths)
+                                    ny = sy_bot - step * (sp * 0.5)
+                                    ys_px.append(ny)
+                                    names.append(midi_to_note_name(mv, sym.key_fifths))
+                                    cls._draw_notehead_and_ledgers(
+                                        p, nx, ny, sy_top, sy_bot, sp,
+                                        is_hollow=is_hollow, is_grace=se.is_grace,
+                                        disp_acc=disp_acc, is_dotted=(is_dot or se.is_dotted),
+                                    )
+                                if se.duration_beats < 3.5:
+                                    avg_y = float(np.mean(ys_px))
+                                    stem_up = avg_y >= (sy_top + 2.0 * sp)
+                                    cls._draw_stem_and_flag(
+                                        p, nx, min(ys_px), max(ys_px), sp,
+                                        stem_up=stem_up, beams=beams, is_grace=se.is_grace,
+                                    )
+
+                                rep_midi = se.midi_notes[-1]
+                                rep_y = ys_px[-1]
+                                disp_name = "+".join(names) if len(names) <= 3 else f"{names[0]}..{names[-1]}({len(names)}音)"
+                                if se.is_grace:
+                                    disp_name = f"({disp_name})"
+
                                 ne = NoteEvent(
                                     event_index=0,
                                     page_index=page_idx,
-                                    staff_index=st_idx,
+                                    staff_index=st_obj.staff_index,
                                     measure_number=sm.measure_number,
                                     note_index_in_measure=k_i,
                                     notes_in_measure=total_e,
                                     x_norm=nx / W,
-                                    y_norm=cy / H,
+                                    y_norm=rep_y / H,
                                     beat_offset=m_beat_start + se.local_beat,
                                     duration_beats=se.duration_beats,
-                                    is_rest=True,
-                                    note_name="休止",
+                                    is_rest=False,
+                                    is_grace=se.is_grace,
+                                    is_hollow=is_hollow,
+                                    is_dotted=(is_dot or se.is_dotted),
+                                    beam_count=beams,
+                                    midi_note=rep_midi,
+                                    note_name=disp_name,
                                     note_type=n_type,
-                                    clef=clef_name,
-                                    hand=hand_tag,
+                                    midi_notes=list(se.midi_notes),
+                                    note_ys_norm=[y_v / H for y_v in ys_px],
+                                    clef=part_meta.clef,
+                                    hand=part_meta.hand,
                                     system_index=sys_global_idx,
+                                    part_name=part_meta.name,
+                                    instrument_timbre=part_meta.timbre,
                                 )
                                 m_info.notes.append(ne)
-                                built.append(ne)
-                                continue
+                                combined_m.append(ne)
+                        st_obj.measures.append(m_info)
 
-                            # 繪製單音或和弦（含加線、臨時記號、符幹、附點）
-                            ys_px: List[float] = []
-                            names: List[str] = []
-                            for mv in se.midi_notes:
-                                step, disp_acc = midi_to_staff_step(mv, clef_name, sym.key_fifths)
-                                ny = sy_bot - step * (sp * 0.5)
-                                ys_px.append(ny)
-                                names.append(midi_to_note_name(mv, sym.key_fifths))
-                                cls._draw_notehead_and_ledgers(
-                                    p, nx, ny, sy_top, sy_bot, sp,
-                                    is_hollow=is_hollow, is_grace=se.is_grace,
-                                    disp_acc=disp_acc, is_dotted=(is_dot or se.is_dotted),
-                                )
-                            # 繪製符幹（非全音符）
-                            if se.duration_beats < 3.5:
-                                avg_y = float(np.mean(ys_px))
-                                stem_up = avg_y >= (sy_top + 2.0 * sp)
-                                cls._draw_stem_and_flag(
-                                    p, nx, min(ys_px), max(ys_px), sp,
-                                    stem_up=stem_up, beams=beams, is_grace=se.is_grace,
-                                )
-
-                            rep_midi = se.midi_notes[-1]  # 最高音為主音顯示
-                            rep_y = ys_px[-1]
-                            disp_name = "+".join(names) if len(names) <= 3 else f"{names[0]}..{names[-1]}({len(names)}音)"
-                            if se.is_grace:
-                                disp_name = f"({disp_name})"
-
-                            ne = NoteEvent(
-                                event_index=0,
-                                page_index=page_idx,
-                                staff_index=st_idx,
-                                measure_number=sm.measure_number,
-                                note_index_in_measure=k_i,
-                                notes_in_measure=total_e,
-                                x_norm=nx / W,
-                                y_norm=rep_y / H,
-                                beat_offset=m_beat_start + se.local_beat,
-                                duration_beats=se.duration_beats,
-                                is_rest=False,
-                                is_grace=se.is_grace,
-                                is_hollow=is_hollow,
-                                is_dotted=(is_dot or se.is_dotted),
-                                beam_count=beams,
-                                midi_note=rep_midi,
-                                note_name=disp_name,
-                                note_type=n_type,
-                                midi_notes=list(se.midi_notes),
-                                note_ys_norm=[y_v / H for y_v in ys_px],
-                                clef=clef_name,
-                                hand=hand_tag,
-                                system_index=sys_global_idx,
-                            )
-                            m_info.notes.append(ne)
-                            built.append(ne)
-                        return built
-
-                    rh_built = render_hand_events(sm.rh_events, sy_rh_top, sy_rh_bot, "treble", rh_staff_idx, "RH" if sym.is_grand_staff else "", m_rh_info)
-                    lh_built = (
-                        render_hand_events(sm.lh_events, sy_lh_top, sy_lh_bot, "bass", lh_staff_idx, "LH", m_lh_info)
-                        if (lh_staff is not None and m_lh_info is not None and lh_staff_idx is not None)
-                        else []
-                    )
-
-                    # 合併本小節雙手事件並依起拍排序（同一拍點右手在前、左手緊接，確保雙手同步發聲）
-                    combined_m = sorted(
-                        rh_built + lh_built,
-                        key=lambda e: (round(e.beat_offset, 4), 0 if e.hand != "LH" else 1, e.is_rest),
+                    combined_m.sort(
+                        key=lambda e: (round(e.beat_offset, 4), e.staff_index, e.is_rest),
                     )
                     for ne in combined_m:
                         cur_ev_idx += 1
@@ -1027,23 +1110,18 @@ class SymbolicScoreLoader:
                         page_res.events.append(ne)
                         analysis.events.append(ne)
 
-                    rh_staff.measures.append(m_rh_info)
-                    if lh_staff is not None and m_lh_info is not None:
-                        lh_staff.measures.append(m_lh_info)
-
-                    analysis.playback_measures.append(
-                        PlaybackMeasure(
-                            measure=m_rh_info,
-                            beat_start=m_beat_start,
-                            beat_end=m_beat_end,
-                            repeat_pass=1,
+                    if lead_m_info is not None:
+                        analysis.playback_measures.append(
+                            PlaybackMeasure(
+                                measure=lead_m_info,
+                                beat_start=m_beat_start,
+                                beat_end=m_beat_end,
+                                repeat_pass=1,
+                            )
                         )
-                    )
                     cur_beat = m_beat_end
 
-                page_res.staves.append(rh_staff)
-                if lh_staff is not None:
-                    page_res.staves.append(lh_staff)
+                page_res.staves.extend(sys_staves)
                 sys_global_idx += 1
 
             p.end()

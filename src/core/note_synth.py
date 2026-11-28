@@ -283,14 +283,21 @@ class NoteSynthesizer:
             return sf2_wave
         return self._synthesize_numpy_fallback(spec.key, midi_note, dur)
 
-    def play_note(self, midi_note: int, duration_sec: float = 0.35, volume_scale: float = 1.0):
-        """即時無縫播放指定 MIDI 音符（支援多音同步疊加）"""
+    def play_note(
+        self,
+        midi_note: int,
+        duration_sec: float = 0.35,
+        volume_scale: float = 1.0,
+        timbre: Optional[str] = None,
+    ):
+        """即時無縫播放指定 MIDI 音符（支援多音同步疊加與重奏總譜各樂器獨立音色）"""
         if not self._enabled or _audio_backend != "pygame":
             return
         if midi_note < 21 or midi_note > 108:
             return
 
-        spec = self._SPECS_BY_KEY.get(self._timbre, self._SPECS_BY_KEY["piano"])
+        t_key = self.TIMBRES.get(timbre, timbre) if timbre else self._timbre
+        spec = self._SPECS_BY_KEY.get(t_key, self._SPECS_BY_KEY.get(self._timbre, self._SPECS_BY_KEY["piano"]))
         # 量化時長至 25ms 精度（最低 50ms、最高 4500ms 以完整支撐鋼琴左手長全音符與短促裝飾音）
         dur_bucket = max(50, min(4500, int(round(duration_sec * 1000 / 25) * 25)))
         cache_key = (spec.key, int(midi_note), dur_bucket)
@@ -325,14 +332,20 @@ class NoteSynthesizer:
         except Exception:
             pass
 
-    def play_chord(self, midi_notes: List[int], duration_sec: float = 0.35, volume_scale: float = 1.0):
-        """同時播放多顆和弦或鋼琴雙手音符，自動依音數微調增益防止多音疊加破音"""
+    def play_chord(
+        self,
+        midi_notes: List[int],
+        duration_sec: float = 0.35,
+        volume_scale: float = 1.0,
+        timbre: Optional[str] = None,
+    ):
+        """同時播放多顆和弦或鋼琴雙手／重奏總譜音符，自動依音數微調增益防止多音疊加破音"""
         valid = sorted({int(m) for m in midi_notes if 21 <= int(m) <= 108})
         if not valid:
             return
         scale = float(volume_scale) / (len(valid) ** 0.35)
         for m in valid:
-            self.play_note(m, duration_sec=duration_sec, volume_scale=scale)
+            self.play_note(m, duration_sec=duration_sec, volume_scale=scale, timbre=timbre)
 
     def stop_all(self):
         """平滑淡出停止目前播放中的樂音"""

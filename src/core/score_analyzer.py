@@ -51,6 +51,8 @@ class NoteEvent:
     clef: str = "treble"
     hand: str = ""
     system_index: int = -1
+    part_name: str = ""
+    instrument_timbre: str = ""
 
     @property
     def all_midi_notes(self) -> List[int]:
@@ -114,6 +116,9 @@ class StaffInfo:
     key_fifths: int = 0
     system_index: int = -1
     paired_staff_index: Optional[int] = None
+    system_staff_indices: List[int] = field(default_factory=list)
+    part_name: str = ""
+    instrument_timbre: str = ""
 
     def y_range_at(self, x_norm: float) -> Tuple[float, float]:
         """取得此行五線譜在指定水平位置 x_norm 的精確 (y_top_norm, y_bot_norm)"""

@@ -407,3 +407,14 @@
   2. 大譜表雙手事件穿插時，查找下一個座標遇到另一手事件便提早 `break`，誤把目標設成小節右界再跳回。
 - **修復**：僅「整小節／多小節休止」才橫跨整小節均勻前進；部分拍休止符與雙手事件一律改以實際拍距 (`nxt.beat_offset - ev.beat_offset`) 嚴格由左向右單調插值推進，同拍點優先對齊實體音符。
 - 新增 `test_playhead_monotonic_across_partial_rests_in_measure` 測試，全部 **26 / 26 項測試通過**。
+
+## 2026-11-28 修正 M3 長符幹誤判小節線、點擊跳轉破音與多樂器重奏總譜多行狀態顯示
+- **修正 M3 被拆成 M3+M4**（`src/core/pdf_vector_analyzer.py`）：
+  - 根因：M3 左手 `A1+A2` 向上延伸至頂線、向下延伸 3.5 間至下加線的長符幹符合舊版 `vy0 <= y_top and vy1 >= y_bot`，被誤認為小節線。
+  - 修復：嚴格要求小節線起訖點必須精準貼合「整個系統上下界」或「單行五線譜上下界（誤差 `<= 0.45*sp`）」，徹底排除所有加線長符幹。
+- **修正播放中滑鼠點擊跳轉破音**（`src/ui/auto_scroll_page.py`）：
+  - 根因：`_on_score_clicked` 重置 `_last_played_event_idx = -1`，導致下一拍迴圈一次把起頭到點擊處的所有舊音同時爆播造成破音。
+  - 修復：點擊跳轉時先淡出舊音、將 `_last_played_event_idx` 精準對齊至目標拍點前，並跳過超過 0.5 拍的過期事件。
+- **支援多種樂器重奏總譜與多行狀態列顯示**（`src/core/symbolic_score_loader.py`、`src/core/pdf_vector_analyzer.py`、`src/core/note_synth.py`、`src/ui/auto_scroll_page.py`）：
+  - 支援單行獨奏（1 行）、鋼琴雙手大譜表（2 行：`右手 RH` + `左手 LH`）以及 3～8 聲部多種樂器重奏總譜（依樂器數顯示 N 行，並自動對應各聲部獨立 SoundFont 音色與貫穿全系統的紅色游標光條）。
+- 新增 3 項單元測試，全專案 **29 / 29 項測試全數通過**。

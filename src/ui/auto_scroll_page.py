@@ -40,9 +40,10 @@ class ScorePageWidget(QWidget):
         self.setFixedSize(pixmap.size())
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        # 演奏游標狀態（歸一化座標 0.0~1.0，支援鋼琴雙手大譜表同步高亮）
+        # 演奏游標狀態（歸一化座標 0.0~1.0，支援鋼琴雙手大譜表與多樂器重奏總譜同步高亮）
         self._active_staff: Optional[StaffInfo] = None
         self._paired_staff: Optional[StaffInfo] = None
+        self._system_staves: List[StaffInfo] = []
         self._cursor_x_norm: Optional[float] = None
         self._note_x_norm: Optional[float] = None
         self._note_y_norm: Optional[float] = None
@@ -81,10 +82,12 @@ class ScorePageWidget(QWidget):
         repeat_pass: int = 1,
         paired_staff: Optional[StaffInfo] = None,
         active_note_pts: Optional[List[Tuple[float, float, bool]]] = None,
+        system_staves: Optional[List[StaffInfo]] = None,
     ):
         """更新本頁的演奏游標位置；若 staff 為 None 則清除本頁游標"""
         self._active_staff = staff
         self._paired_staff = paired_staff
+        self._system_staves = list(system_staves) if system_staves else []
         self._cursor_x_norm = cursor_x_norm
         self._note_x_norm = note_x_norm
         self._note_y_norm = note_y_norm
@@ -98,6 +101,7 @@ class ScorePageWidget(QWidget):
         if self._active_staff is not None or self._cursor_x_norm is not None:
             self._active_staff = None
             self._paired_staff = None
+            self._system_staves = []
             self._cursor_x_norm = None
             self._note_x_norm = None
             self._note_y_norm = None
@@ -173,17 +177,19 @@ class ScorePageWidget(QWidget):
             painter.setBrush(QBrush(QColor(235, 160, 20, 185)))
             painter.drawRoundedRect(QRectF(staff_left, band_top_s, 4.0, band_h_s), 2.0, 2.0)
 
-        # 3b. 半透明垂直光條 + 紅色中心細線（若為鋼琴雙手大譜表，紅線自動貫穿上下雙行！）
+        # 3b. 半透明垂直光條 + 紅色中心細線（鋼琴大譜表或 N 行多樂器重奏總譜自動貫穿整個系統所有行！）
         c_yt_n, c_yb_n = st.y_range_at(self._cursor_x_norm)
-        if self._paired_staff is not None:
-            p_yt_n, p_yb_n = self._paired_staff.y_range_at(self._cursor_x_norm)
+        extra_staves = [s for s in self._system_staves if s is not st]
+        if not extra_staves and self._paired_staff is not None:
+            extra_staves = [self._paired_staff]
+        for ex_st in extra_staves:
+            p_yt_n, p_yb_n = ex_st.y_range_at(self._cursor_x_norm)
             c_yt_n = min(c_yt_n, p_yt_n)
             c_yb_n = max(c_yb_n, p_yb_n)
-            # 同步繪製配對下行淡黃底光
             p_top = max(4.0, p_yt_n * h - pad_y)
             p_bot = min(h - 4.0, p_yb_n * h + pad_y)
-            p_left = max(4.0, self._paired_staff.x_left_norm * w - sp_px * 0.8)
-            p_right = min(w - 4.0, self._paired_staff.x_right_norm * w + sp_px * 0.8)
+            p_left = max(4.0, ex_st.x_left_norm * w - sp_px * 0.8)
+            p_right = min(w - 4.0, ex_st.x_right_norm * w + sp_px * 0.8)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(QColor(255, 224, 102, 48)))
             painter.drawRoundedRect(QRectF(p_left, p_top, max(20.0, p_right - p_left), max(16.0, p_bot - p_top)), 6.0, 6.0)
@@ -383,6 +389,7 @@ class ScoreViewWidget(QWidget):
         repeat_pass: int = 1,
         paired_staff: Optional[StaffInfo] = None,
         active_note_pts: Optional[List[Tuple[float, float, bool]]] = None,
+        system_staves: Optional[List[StaffInfo]] = None,
     ):
         for i, page_w in enumerate(self.page_labels):
             if i == page_index and staff is not None and cursor_x_norm is not None:
@@ -391,6 +398,7 @@ class ScoreViewWidget(QWidget):
                     is_rest, is_grace, repeat_pass,
                     paired_staff=paired_staff,
                     active_note_pts=active_note_pts,
+                    system_staves=system_staves,
                 )
             else:
                 page_w.clear_playhead()
@@ -988,15 +996,19 @@ class AutoScrollPage(QWidget):
             "QPushButton:hover { background-color: #a82e00; }"
         )
         self._scroll_subpixel = 0.0
-        # 計算起播拍點之前最後一個事件索引，避免中途起播重播前面小節，同時確保當前拍點雙手同時發聲
+        # 計算起播拍點之前最後一個事件索引，避免中途起播重播前面小節，同時確保當前拍點雙手／全樂器同步發聲
+        self._set_played_index_before(self._current_beat)
+        self._last_tick_time = time.perf_counter()
+
+    def _set_played_index_before(self, beat: float):
+        """將已觸發索引精準對齊至指定拍點之前，杜絕點擊跳轉或中途起播時一次重播所有舊音造成破音！"""
         self._last_played_event_idx = -1
         if self._use_note_tracking() and self._analysis:
             for k_i, ev_k in enumerate(self._analysis.events):
-                if ev_k.beat_offset < self._current_beat - 1e-3:
+                if ev_k.beat_offset < beat - 1e-3:
                     self._last_played_event_idx = k_i
                 else:
                     break
-        self._last_tick_time = time.perf_counter()
         # 立即觸發當前音符發聲與畫面更新
         if self._use_note_tracking():
             self._sync_playhead_visual(scroll_to_staff=True)
@@ -1229,6 +1241,20 @@ class AutoScrollPage(QWidget):
             else None
         )
 
+        # 蒐集目前 System 的所有行（單行、2 行鋼琴雙手、或 N 行多樂器重奏總譜）
+        system_staves: List[StaffInfo] = []
+        if staff.system_staff_indices:
+            for s_idx_i in staff.system_staff_indices:
+                st_i = self._analysis.get_staff(ev.page_index, s_idx_i)
+                if st_i is not None:
+                    system_staves.append(st_i)
+        if not system_staves:
+            system_staves = [staff]
+            if paired_staff is not None:
+                system_staves.append(paired_staff)
+        system_staves.sort(key=lambda s: s.staff_index)
+        valid_staves = {s.staff_index for s in system_staves}
+
         # 查找當前小節範圍（供全小節休止與最後一音滑行至小節線用）
         cur_m_obj = None
         for m in staff.measures:
@@ -1247,17 +1273,14 @@ class AutoScrollPage(QWidget):
             frac = max(0.0, min(1.0, (self._current_beat - ev.beat_offset) / span_b))
             cursor_x = start_x + (end_x - start_x) * frac
         else:
-            # 尋找同一小節（或同行同遍）下一個起拍事件，依實際拍距 (nxt.beat_offset - ev.beat_offset) 嚴格由左至右單調插值！
+            # 尋找同一小節（或同系統同遍）下一個起拍事件，依實際拍距 (nxt.beat_offset - ev.beat_offset) 嚴格由左至右單調插值！
             next_x = cur_m_obj.x_end_norm if cur_m_obj is not None else staff.x_right_norm
             span_b = (
                 max(1e-4, cur_m_obj.beat_end - ev.beat_offset)
                 if cur_m_obj is not None and cur_m_obj.beat_end > ev.beat_offset + 1e-4
                 else max(1e-4, ev.duration_beats)
             )
-            valid_staves = {ev.staff_index}
-            if staff.paired_staff_index is not None:
-                valid_staves.add(staff.paired_staff_index)
-            for j in range(idx + 1, min(len(events), idx + 24)):
+            for j in range(idx + 1, min(len(events), idx + 32)):
                 nxt = events[j]
                 if nxt.beat_offset <= ev.beat_offset + 1e-4:
                     continue
@@ -1271,25 +1294,30 @@ class AutoScrollPage(QWidget):
                         span_b = max(1e-4, nxt.beat_offset - ev.beat_offset)
                         break
                     continue
-                # 跨入同行下一小節時，本小節內先平滑推進到小節右界
                 break
             frac = max(0.0, min(1.0, (self._current_beat - ev.beat_offset) / span_b))
             cursor_x = ev.x_norm + (next_x - ev.x_norm) * frac
 
-        # 蒐集本拍點雙手同時發聲的所有音符座標（供大譜表同時雙手高亮光圈！）
+        # 蒐集本拍點整個系統所有行（雙手／多樂器）正在發聲的事件與光圈座標
         active_pts: List[Tuple[float, float, bool]] = []
-        win_lo = max(0, idx - 6)
-        win_hi = min(len(events), idx + 8)
+        active_by_staff: dict = {}
+        win_lo = max(0, idx - 24)
+        win_hi = min(len(events), idx + 24)
         for k_a in range(win_lo, win_hi):
             ev_a = events[k_a]
-            if ev_a.page_index != ev.page_index or ev_a.is_rest:
+            if ev_a.page_index != ev.page_index or ev_a.staff_index not in valid_staves:
                 continue
             if ev_a.beat_offset - 1e-3 <= self._current_beat < (ev_a.beat_offset + max(0.05, ev_a.duration_beats)):
-                if ev_a.note_ys_norm:
-                    for yn_v in ev_a.note_ys_norm:
-                        active_pts.append((ev_a.x_norm, yn_v, ev_a.is_grace))
-                else:
-                    active_pts.append((ev_a.x_norm, ev_a.y_norm, ev_a.is_grace))
+                # 同一行若有多重聲部，保留最新起拍或非休止事件
+                prev_s = active_by_staff.get(ev_a.staff_index)
+                if prev_s is None or (prev_s.is_rest and not ev_a.is_rest) or ev_a.beat_offset >= prev_s.beat_offset:
+                    active_by_staff[ev_a.staff_index] = ev_a
+                if not ev_a.is_rest:
+                    if ev_a.note_ys_norm:
+                        for yn_v in ev_a.note_ys_norm:
+                            active_pts.append((ev_a.x_norm, yn_v, ev_a.is_grace))
+                    else:
+                        active_pts.append((ev_a.x_norm, ev_a.y_norm, ev_a.is_grace))
 
         self.score_view.update_playhead(
             page_index=ev.page_index,
@@ -1302,6 +1330,7 @@ class AutoScrollPage(QWidget):
             repeat_pass=ev.repeat_pass,
             paired_staff=paired_staff,
             active_note_pts=active_pts,
+            system_staves=system_staves,
         )
 
         # 組裝反覆記號狀態標籤
@@ -1318,9 +1347,39 @@ class AutoScrollPage(QWidget):
         if ev.repeat_pass >= 2:
             rep_detail += f" (目前第 {ev.repeat_pass} 遍)"
 
-        # 更新左上徽章與音符校準詳細資訊列
-        hand_badge = f"[{ev.hand}] " if ev.hand else ""
-        if ev.is_rest:
+        # 更新左上徽章與多行狀態資訊列（單行譜顯示 1 行；鋼琴雙手顯示 2 行；N 種樂器重奏總譜依聲部數顯示 N 行！）
+        if len(system_staves) >= 2:
+            badge_parts: List[str] = []
+            detail_lines: List[str] = []
+            for s_pos, st_obj in enumerate(system_staves):
+                st_ev = active_by_staff.get(st_obj.staff_index)
+                p_label = st_obj.part_name or (
+                    "右手 RH" if (len(system_staves) == 2 and s_pos == 0)
+                    else ("左手 LH" if (len(system_staves) == 2 and s_pos == 1) else f"聲部 {s_pos + 1}")
+                )
+                short_tag = (
+                    "RH" if "RH" in p_label else ("LH" if "LH" in p_label else p_label[:4])
+                )
+                if st_ev is None or st_ev.is_rest:
+                    r_txt = st_ev.note_type if st_ev is not None else "休止"
+                    badge_parts.append(f"{short_tag}:休")
+                    detail_lines.append(
+                        f"🔎 [{p_label}] 第 {ev.measure_number} 小節  |  類型：【{r_txt}】  |  音高：靜音 (Rest)"
+                    )
+                else:
+                    mids_str = ", ".join(str(m) for m in st_ev.all_midi_notes) if len(st_ev.all_midi_notes) > 1 else f"{st_ev.midi_note} • {st_ev.freq_hz:.1f} Hz"
+                    badge_parts.append(f"{short_tag}:{st_ev.note_name}")
+                    detail_lines.append(
+                        f"🔎 [{p_label}] 第 {st_ev.measure_number} 小節 第 {st_ev.note_index_in_measure}/{st_ev.notes_in_measure} 音  |  "
+                        f"類型：【{st_ev.note_type}】  |  音高：{st_ev.note_name} (MIDI {mids_str})  |  時長：{st_ev.duration_beats:.2f} 拍"
+                    )
+            rep_sym = "||: " if (ev.repeat_start and ev.note_index_in_measure == 1) else ""
+            summary_str = " | ".join(badge_parts[:3]) + (" ..." if len(badge_parts) > 3 else "")
+            self.measure_label.setText(
+                f"小節：{rep_sym}{ev.measure_number} / {self._analysis.total_measures}{pass_badge}  ♪ {summary_str}"
+            )
+            self.note_detail_label.setText("\n".join(detail_lines) + (f"\n{rep_detail.strip()}" if rep_detail else ""))
+        elif ev.is_rest:
             m_range = (
                 f"{ev.measure_number}~{ev.measure_number + ev.rest_measures - 1}"
                 if ev.rest_measures > 1 else f"{ev.measure_number}"
@@ -1328,33 +1387,37 @@ class AutoScrollPage(QWidget):
             self.measure_label.setText(f"小節：{m_range} / {self._analysis.total_measures}{pass_badge}  ({ev.note_type})")
             self.note_detail_label.setText(
                 f"🔎 事件 #{ev.event_index}/{len(events)}  |  "
-                f"{hand_badge}第 {ev.staff_index + 1} 行 • 第 {m_range} 小節 (第 1/1 個事件)  |  "
+                f"第 {ev.staff_index + 1} 行 • 第 {m_range} 小節 (第 1/1 個事件)  |  "
                 f"類型：【{ev.note_type}】  |  音高：靜音 (Rest)  |  "
                 f"時值：{ev.duration_beats:.2f} 拍 (起始 {ev.beat_offset:.2f} 拍){rep_detail}"
             )
         else:
             rep_sym = "||: " if (ev.repeat_start and ev.note_index_in_measure == 1) else ""
             self.measure_label.setText(
-                f"小節：{rep_sym}{ev.measure_number} / {self._analysis.total_measures}{pass_badge}  ♪ {hand_badge}{ev.note_name}"
+                f"小節：{rep_sym}{ev.measure_number} / {self._analysis.total_measures}{pass_badge}  ♪ {ev.note_name}"
             )
             self.note_detail_label.setText(
                 f"🔎 事件 #{ev.event_index}/{len(events)}  |  "
-                f"{hand_badge}第 {ev.staff_index + 1} 行 • 第 {ev.measure_number} 小節 "
+                f"第 {ev.staff_index + 1} 行 • 第 {ev.measure_number} 小節 "
                 f"第 {ev.note_index_in_measure}/{ev.notes_in_measure} 個音符  |  "
                 f"類型：【{ev.note_type}】  |  "
                 f"音高：{ev.note_name} (MIDI {ev.midi_note} • {ev.freq_hz:.1f} Hz)  |  "
                 f"時長：{ev.duration_beats:.2f} 拍 (橫槓={ev.beam_count}){rep_detail}"
             )
 
-        # 連續播放中：一次觸發所有 beat_offset <= _current_beat 的未發聲事件（完整支援鋼琴雙手同步與多音和弦！）
+        # 連續播放中：一次觸發所有 beat_offset <= _current_beat 的未發聲事件（並略過超過 0.5 拍的過期事件，徹底防跳轉破音！）
         if self._is_playing:
             beats_per_sec = max(0.2, (self._bpm / 60.0) * self._scroll_speed)
             next_k = self._last_played_event_idx + 1
             triggered_any_note = False
             saw_rest_only = False
+            use_part_timbres = len(system_staves) >= 3
             while next_k < len(events) and events[next_k].beat_offset <= self._current_beat + 1e-4:
                 ev_k = events[next_k]
                 self._last_played_event_idx = next_k
+                if ev_k.beat_offset < self._current_beat - 0.5:
+                    next_k += 1
+                    continue
                 mids = ev_k.all_midi_notes
                 if mids:
                     if "跳音" in ev_k.articulation:
@@ -1364,10 +1427,11 @@ class AutoScrollPage(QWidget):
                     else:
                         gate = 0.94
                     dur_sec = max(0.08, (ev_k.duration_beats / beats_per_sec) * gate)
+                    ev_timbre = ev_k.instrument_timbre if (use_part_timbres and ev_k.instrument_timbre) else None
                     if len(mids) > 1:
-                        self._synth.play_chord(mids, duration_sec=dur_sec)
+                        self._synth.play_chord(mids, duration_sec=dur_sec, timbre=ev_timbre)
                     else:
-                        self._synth.play_note(mids[0], duration_sec=dur_sec)
+                        self._synth.play_note(mids[0], duration_sec=dur_sec, timbre=ev_timbre)
                     triggered_any_note = True
                 elif ev_k.is_rest and not self._analysis.is_grand_staff:
                     saw_rest_only = True
@@ -1413,11 +1477,24 @@ class AutoScrollPage(QWidget):
 
         nearest_ev = min(staff_events, key=lambda ev: abs(ev.x_norm - x_norm))
         self._current_beat = nearest_ev.beat_offset + min(1e-4, nearest_ev.duration_beats * 0.05)
-        self._last_scrolled_staff = (page_index, best_staff.staff_index)
-        self._last_played_event_idx = -1
+        self._last_scrolled_staff = (
+            page_index,
+            best_staff.system_index if best_staff.system_index >= 0 else best_staff.staff_index,
+        )
+        # 播放中點選跳轉：先淡出舊音、精準重置已觸發索引至目標拍點前，徹底根除一次爆播前面全部音符的破音問題！
+        if self._is_playing:
+            self._synth.stop_all()
+            self._set_played_index_before(self._current_beat)
+            self._last_tick_time = time.perf_counter()
+        else:
+            self._last_played_event_idx = -1
         self._sync_playhead_visual(scroll_to_staff=False)
-        if not self._is_playing and not nearest_ev.is_rest and nearest_ev.midi_note > 0:
-            self._synth.play_note(nearest_ev.midi_note, duration_sec=0.28)
+        if not self._is_playing and not nearest_ev.is_rest and nearest_ev.all_midi_notes:
+            self._synth.play_chord(
+                nearest_ev.all_midi_notes,
+                duration_sec=0.30,
+                timbre=(nearest_ev.instrument_timbre or None),
+            )
         self.status_text.setText(
             f"已點選：第 {nearest_ev.measure_number} 小節第 {nearest_ev.note_index_in_measure} 個 → "
             f"{nearest_ev.note_name} ({nearest_ev.note_type})"

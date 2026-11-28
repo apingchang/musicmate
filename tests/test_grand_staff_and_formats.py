@@ -297,6 +297,106 @@ class TestGrandStaffAndSymbolicFormats(unittest.TestCase):
         for a, b in zip(xs, xs[1:]):
             self.assertGreaterEqual(b, a - 1e-6)
 
+    def test_pdf_vector_long_ledger_stem_not_barline(self):
+        """驗證 M3 左手低音 A1+A2 向下突出 3.5*sp 之長符幹絕不被誤判為小節線（不把 M3 拆成 M3+M4）"""
+        from src.core.pdf_vector_analyzer import PDFVectorAnalyzer, _VecStaff
+
+        rh = _VecStaff(y_lines=[100.0, 106.0, 112.0, 118.0, 124.0], x_left=50.0, x_right=540.0, sp=6.0, header_end_x=110.0)
+        lh = _VecStaff(y_lines=[170.0, 176.0, 182.0, 188.0, 194.0], x_left=50.0, x_right=540.0, sp=6.0, header_end_x=110.0)
+        v_segs = [
+            (280.0, 100.0, 194.0),  # 真實跨雙行小節線
+            (310.0, 170.0, 216.0),  # M3 左手 A1+A2 長符幹（突出底線 22pt ≈ 3.6*sp！）
+            (540.0, 100.0, 194.0),  # 行尾貫穿小節線
+        ]
+        PDFVectorAnalyzer._find_staff_barlines(lh, v_segs, sys_top=100.0, sys_bot=194.0, is_multi_staff=True)
+        self.assertEqual(len(lh.barlines_x), 2)
+        self.assertNotIn(310.0, lh.barlines_x)
+
+    def test_click_seek_during_playback_no_past_note_burst(self):
+        """驗證播放中滑鼠點擊跳轉至後方小節時，只會觸發目標拍點音符，絕不一次爆播前面全部舊音導致破音"""
+        xml_path = os.path.join(self.tmpdir.name, "seek_burst.musicxml")
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><octave>5</octave></pitch><duration>4</duration><type>quarter</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+      <note><pitch><step>A</step><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(xml_content)
+
+        ui = AutoScrollPage()
+        self.assertTrue(ui.load_file(xml_path))
+        played = []
+        ui._synth.play_note = lambda m, duration_sec=0.35, volume_scale=1.0, timbre=None: played.append(m)
+        ui._synth.play_chord = lambda ms, duration_sec=0.35, volume_scale=1.0, timbre=None: played.extend(ms)
+        ui._is_playing = True
+        ui._last_played_event_idx = 0
+
+        # 點擊第 2 小節最後一顆音 (A5 = MIDI 81)
+        target_ev = ui._analysis.events[-1]
+        ui._on_score_clicked(target_ev.page_index, target_ev.x_norm, target_ev.y_norm)
+        # 只能觸發目標音 A5 (81)，絕不可重播前面的 C5/D5/E5/F5/G5！
+        self.assertEqual(played, [81])
+
+    def test_multi_instrument_ensemble_3_parts_and_multiline_status(self):
+        """驗證多種樂器重奏總譜（長笛 + 小提琴 + 大提琴 3 聲部）完整解析、對應各自音色並於狀態列顯示 3 行"""
+        xml_path = os.path.join(self.tmpdir.name, "trio.musicxml")
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <work><work-title>Chamber Trio</work-title></work>
+  <part-list>
+    <score-part id="P1"><part-name>Flute</part-name></score-part>
+    <score-part id="P2"><part-name>Violin</part-name></score-part>
+    <score-part id="P3"><part-name>Cello</part-name></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>
+      <note><pitch><step>C</step><octave>6</octave></pitch><duration>16</duration><type>whole</type></note>
+    </measure>
+  </part>
+  <part id="P2">
+    <measure number="1">
+      <attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>16</duration><type>whole</type></note>
+    </measure>
+  </part>
+  <part id="P3">
+    <measure number="1">
+      <attributes><divisions>4</divisions><time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>F</sign><line>4</line></clef></attributes>
+      <note><pitch><step>C</step><octave>3</octave></pitch><duration>16</duration><type>whole</type></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(xml_content)
+
+        ui = AutoScrollPage()
+        self.assertTrue(ui.load_file(xml_path))
+        staves = ui._analysis.pages[0].staves
+        self.assertEqual(len(staves), 3)
+        self.assertEqual([s.instrument_timbre for s in staves], ["長笛", "小提琴", "大提琴"])
+        self.assertEqual(staves[0].system_staff_indices, [0, 1, 2])
+        # 狀態列應依樂器數量自動顯示 3 行
+        lines = [ln for ln in ui.note_detail_label.text().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 3)
+        self.assertIn("Flute", lines[0])
+        self.assertIn("Violin", lines[1])
+        self.assertIn("Cello", lines[2])
+
 
 if __name__ == "__main__":
     unittest.main()

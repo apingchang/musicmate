@@ -169,29 +169,35 @@ class PDFVectorAnalyzer:
                 analysis.pages.append(PageAnalysis(page_idx, int(round(pw)), int(round(ph)), 0.0))
                 continue
 
-            # 偵測大譜表成對結構（跨雙行貫穿小節線或相鄰垂直間距配對）
-            is_grand_page = cls._pair_grand_staves(staves, v_segs)
-            if is_grand_page:
+            # 偵測大譜表或多種樂器重奏總譜系統（2 行鋼琴大譜表或 N 行跨行貫穿小節線總譜）
+            sys_groups = cls._group_systems(staves, v_segs)
+            is_multi_page = any(len(g) >= 2 for g in sys_groups)
+            if is_multi_page:
                 analysis.is_grand_staff = True
 
-            # 為每行五線譜識別譜號、調號、拍號與小節線
-            for st in staves:
-                cls._parse_staff_header(st, glyphs, carry_key_fifths)
-                if st.key_fifths != 0:
-                    carry_key_fifths = st.key_fifths
-                if st.time_sig and analysis.detected_time_sig is None:
-                    analysis.detected_time_sig = st.time_sig
-                    ts_beats_map = {"2/4": 2.0, "3/4": 3.0, "4/4": 4.0, "2/2": 4.0, "6/8": 6.0}
-                    if st.time_sig in ts_beats_map:
-                        carry_beats = ts_beats_map[st.time_sig]
-                        analysis.beats_per_measure = carry_beats
-                cls._find_staff_barlines(st, v_segs)
+            # 為每行五線譜識別譜號、調號、拍號與嚴格小節線（杜絕 M3 左手 A1+A2 長符幹誤判為小節線！）
+            for grp in sys_groups:
+                sys_top = staves[grp[0]].y_top
+                sys_bot = staves[grp[-1]].y_bot
+                is_multi_sys = len(grp) >= 2
+                for s_i in grp:
+                    st = staves[s_i]
+                    cls._parse_staff_header(st, glyphs, carry_key_fifths)
+                    if st.key_fifths != 0:
+                        carry_key_fifths = st.key_fifths
+                    if st.time_sig and analysis.detected_time_sig is None:
+                        analysis.detected_time_sig = st.time_sig
+                        ts_beats_map = {"2/4": 2.0, "3/4": 3.0, "4/4": 4.0, "2/2": 4.0, "6/8": 6.0}
+                        if st.time_sig in ts_beats_map:
+                            carry_beats = ts_beats_map[st.time_sig]
+                            analysis.beats_per_measure = carry_beats
+                    cls._find_staff_barlines(st, v_segs, sys_top=sys_top, sys_bot=sys_bot, is_multi_staff=is_multi_sys)
 
             if page_idx == 0:
                 analysis.detected_key_fifths = carry_key_fifths
 
-            # 將同一 System 的上下行小節線對齊
-            cls._align_paired_barlines(staves)
+            # 將同一 System 的所有行小節線對齊
+            cls._align_system_barlines(staves, sys_groups)
 
             # 將音符與臨時記號歸屬到對應五線譜
             staff_glyphs: List[List[_Glyph]] = [[] for _ in staves]
@@ -208,7 +214,7 @@ class PDFVectorAnalyzer:
                 skew_angle=0.0,
                 detected_time_sig=analysis.detected_time_sig,
                 detected_key_fifths=carry_key_fifths,
-                is_grand_staff=is_grand_page,
+                is_grand_staff=is_multi_page,
             )
 
             # 建立 StaffInfo 清單
@@ -229,73 +235,61 @@ class PDFVectorAnalyzer:
                 )
                 staff_infos.append(si)
 
-            # 依 System 迭代（成對大譜表一起推進小節號與拍點，單行譜獨立推進）
-            visited = set()
-            for s_i, st in enumerate(staves):
-                if s_i in visited:
-                    continue
-                visited.add(s_i)
-                pair_i = st.paired_local_idx
-                if pair_i is not None and pair_i not in visited:
-                    visited.add(pair_i)
-                    rh_idx, lh_idx = s_i, pair_i
-                    staff_infos[rh_idx].system_index = global_sys_idx
-                    staff_infos[lh_idx].system_index = global_sys_idx
-                    edges_x = cls._measure_edges(staves[rh_idx])
-                    n_m = max(0, len(edges_x) - 1)
-                    for m_k in range(n_m):
-                        cur_measure += 1
-                        mx1, mx2 = edges_x[m_k], edges_x[m_k + 1]
-                        m_beat_start = cur_beat
-                        m_beat_end = cur_beat + carry_beats
-
-                        rh_m_info, rh_evs = cls._build_measure_events(
-                            staves[rh_idx], staff_glyphs[rh_idx], page_idx, rh_idx, cur_measure,
-                            mx1, mx2, m_beat_start, carry_beats, pw, ph, "RH", global_sys_idx,
-                        )
-                        lh_m_info, lh_evs = cls._build_measure_events(
-                            staves[lh_idx], staff_glyphs[lh_idx], page_idx, lh_idx, cur_measure,
-                            mx1, mx2, m_beat_start, carry_beats, pw, ph, "LH", global_sys_idx,
-                        )
-                        staff_infos[rh_idx].measures.append(rh_m_info)
-                        staff_infos[lh_idx].measures.append(lh_m_info)
-
-                        combined = sorted(
-                            rh_evs + lh_evs,
-                            key=lambda e: (round(e.beat_offset, 4), 0 if e.hand != "LH" else 1, e.is_rest),
-                        )
-                        for ne in combined:
-                            cur_ev_idx += 1
-                            ne.event_index = cur_ev_idx
-                            page_res.events.append(ne)
-                            analysis.events.append(ne)
-
-                        analysis.playback_measures.append(
-                            PlaybackMeasure(measure=rh_m_info, beat_start=m_beat_start, beat_end=m_beat_end, repeat_pass=1)
-                        )
-                        cur_beat = m_beat_end
-                else:
+            # 依 System 群組迭代（支援單行、2 行鋼琴大譜表及 N 行多樂器重奏總譜）
+            for grp in sys_groups:
+                is_piano_pair = len(grp) == 2 and staves[grp[0]].clef == "treble" and staves[grp[1]].clef == "bass"
+                for pos_in_sys, s_i in enumerate(grp):
                     staff_infos[s_i].system_index = global_sys_idx
-                    edges_x = cls._measure_edges(st)
-                    for m_k in range(max(0, len(edges_x) - 1)):
-                        cur_measure += 1
-                        mx1, mx2 = edges_x[m_k], edges_x[m_k + 1]
-                        m_beat_start = cur_beat
-                        m_beat_end = cur_beat + carry_beats
+                    staff_infos[s_i].system_staff_indices = list(grp)
+                    if len(grp) == 1:
+                        staff_infos[s_i].part_name = ""
+                    elif is_piano_pair:
+                        staff_infos[s_i].part_name = "右手 RH" if pos_in_sys == 0 else "左手 LH"
+                    else:
+                        clef_zh = "高音" if staves[s_i].clef == "treble" else "低音"
+                        staff_infos[s_i].part_name = f"聲部 {pos_in_sys + 1} ({clef_zh})"
+
+                edges_x = cls._measure_edges(staves[grp[0]])
+                n_m = max(0, len(edges_x) - 1)
+                for m_k in range(n_m):
+                    cur_measure += 1
+                    mx1, mx2 = edges_x[m_k], edges_x[m_k + 1]
+                    m_beat_start = cur_beat
+                    m_beat_end = cur_beat + carry_beats
+                    combined: List[NoteEvent] = []
+                    lead_m_info = None
+
+                    for pos_in_sys, s_i in enumerate(grp):
+                        if is_piano_pair:
+                            hand_tag = "RH" if pos_in_sys == 0 else "LH"
+                        elif len(grp) >= 2:
+                            hand_tag = f"P{pos_in_sys + 1}"
+                        else:
+                            hand_tag = ""
                         m_info, evs = cls._build_measure_events(
-                            st, staff_glyphs[s_i], page_idx, s_i, cur_measure,
-                            mx1, mx2, m_beat_start, carry_beats, pw, ph, "", global_sys_idx,
+                            staves[s_i], staff_glyphs[s_i], page_idx, s_i, cur_measure,
+                            mx1, mx2, m_beat_start, carry_beats, pw, ph, hand_tag, global_sys_idx,
+                            part_name=staff_infos[s_i].part_name,
                         )
                         staff_infos[s_i].measures.append(m_info)
-                        for ne in evs:
-                            cur_ev_idx += 1
-                            ne.event_index = cur_ev_idx
-                            page_res.events.append(ne)
-                            analysis.events.append(ne)
+                        if lead_m_info is None:
+                            lead_m_info = m_info
+                        combined.extend(evs)
+
+                    combined.sort(
+                        key=lambda e: (round(e.beat_offset, 4), e.staff_index, e.is_rest),
+                    )
+                    for ne in combined:
+                        cur_ev_idx += 1
+                        ne.event_index = cur_ev_idx
+                        page_res.events.append(ne)
+                        analysis.events.append(ne)
+
+                    if lead_m_info is not None:
                         analysis.playback_measures.append(
-                            PlaybackMeasure(measure=m_info, beat_start=m_beat_start, beat_end=m_beat_end, repeat_pass=1)
+                            PlaybackMeasure(measure=lead_m_info, beat_start=m_beat_start, beat_end=m_beat_end, repeat_pass=1)
                         )
-                        cur_beat = m_beat_end
+                    cur_beat = m_beat_end
                 global_sys_idx += 1
 
             page_res.staves = staff_infos
@@ -408,35 +402,43 @@ class PDFVectorAnalyzer:
         return staves
 
     @staticmethod
-    def _pair_grand_staves(
+    def _group_systems(
         staves: List[_VecStaff],
         v_segs: List[Tuple[float, float, float]],
-    ) -> bool:
-        """若相鄰兩行五線譜有貫穿雙行的小節線或左端系統連線，配對為鋼琴雙手大譜表"""
-        paired_any = False
+    ) -> List[List[int]]:
+        """將有跨行貫穿小節線或左端系統連線之相鄰五線譜合併為系統群組（支援 2 行鋼琴與 N 行多樂器重奏總譜）"""
+        if not staves:
+            return []
+        groups: List[List[int]] = []
         i = 0
-        while i + 1 < len(staves):
-            s0, s1 = staves[i], staves[i + 1]
-            gap = s1.y_top - s0.y_bot
-            if (
-                abs(s0.x_left - s1.x_left) <= s0.sp * 2.5
-                and s0.sp * 1.5 <= gap <= s0.sp * 16.0
-            ):
-                # 檢查是否有垂直線貫穿 s0.y_top..s1.y_bot
-                spanning_bars = [
+        while i < len(staves):
+            grp = [i]
+            while grp[-1] + 1 < len(staves):
+                s_prev = staves[grp[-1]]
+                s_next = staves[grp[-1] + 1]
+                gap = s_next.y_top - s_prev.y_bot
+                if not (
+                    abs(s_prev.x_left - s_next.x_left) <= s_prev.sp * 2.5
+                    and s_prev.sp * 1.2 <= gap <= s_prev.sp * 18.0
+                ):
+                    break
+                # 檢查是否有垂直線（左端系統線或跨行小節線）連接 s_prev 與 s_next
+                bridge_bars = [
                     vx for vx, vy0, vy1 in v_segs
-                    if (s0.x_left - s0.sp * 2.0) <= vx <= (s0.x_right + s0.sp * 2.0)
-                    and vy0 <= s0.y_top + s0.sp * 0.8
-                    and vy1 >= s1.y_bot - s1.sp * 0.8
+                    if (s_prev.x_left - s_prev.sp * 2.0) <= vx <= (s_prev.x_right + s_prev.sp * 2.0)
+                    and vy0 <= s_prev.y_top + s_prev.sp * 0.8
+                    and vy1 >= s_next.y_bot - s_next.sp * 0.8
                 ]
-                if len(spanning_bars) >= 2:
-                    s0.paired_local_idx = i + 1
-                    s1.paired_local_idx = i
-                    paired_any = True
-                    i += 2
-                    continue
-            i += 1
-        return paired_any
+                if len(bridge_bars) >= 1:
+                    grp.append(grp[-1] + 1)
+                else:
+                    break
+            if len(grp) == 2:
+                staves[grp[0]].paired_local_idx = grp[1]
+                staves[grp[1]].paired_local_idx = grp[0]
+            groups.append(grp)
+            i = grp[-1] + 1
+        return groups
 
     @staticmethod
     def _parse_staff_header(st: _VecStaff, glyphs: List[_Glyph], default_key_fifths: int):
@@ -524,13 +526,32 @@ class PDFVectorAnalyzer:
         st.header_end_x = max(st.header_end_x, clef_x1 + sp * 0.5)
 
     @staticmethod
-    def _find_staff_barlines(st: _VecStaff, v_segs: List[Tuple[float, float, float]]):
+    def _find_staff_barlines(
+        st: _VecStaff,
+        v_segs: List[Tuple[float, float, float]],
+        sys_top: Optional[float] = None,
+        sys_bot: Optional[float] = None,
+        is_multi_staff: bool = False,
+    ):
+        """嚴格辨識小節線：端點必須精準起迄於五線譜上下界或整個系統上下界，徹底杜絕 M3 左手 A1+A2 長符幹誤判為小節線！"""
         sp = st.sp
         xs = []
+        s_top = st.y_top if sys_top is None else sys_top
+        s_bot = st.y_bot if sys_bot is None else sys_bot
         for vx, vy0, vy1 in v_segs:
-            if (st.header_end_x + sp * 1.5) <= vx <= (st.x_right + sp * 0.8):
-                if vy0 <= st.y_top + sp * 0.45 and vy1 >= st.y_bot - sp * 0.45:
-                    xs.append(vx)
+            if not ((st.header_end_x + sp * 1.5) <= vx <= (st.x_right + sp * 0.8)):
+                continue
+            is_sys_bar = (
+                is_multi_staff
+                and abs(vy0 - s_top) <= sp * 0.65
+                and abs(vy1 - s_bot) <= sp * 0.65
+            )
+            is_exact_staff_bar = (
+                abs(vy0 - st.y_top) <= sp * 0.45
+                and abs(vy1 - st.y_bot) <= sp * 0.45
+            )
+            if is_sys_bar or is_exact_staff_bar:
+                xs.append(vx)
         xs.sort()
         dedup: List[float] = []
         for x in xs:
@@ -539,18 +560,18 @@ class PDFVectorAnalyzer:
         st.barlines_x = dedup
 
     @staticmethod
-    def _align_paired_barlines(staves: List[_VecStaff]):
-        for i, st in enumerate(staves):
-            j = st.paired_local_idx
-            if j is not None and j > i:
-                # 聯集取接近的小節線，確保上下行小節完全同步
-                combined = sorted(st.barlines_x + staves[j].barlines_x)
-                merged: List[float] = []
-                for x in combined:
-                    if not merged or (x - merged[-1]) >= st.sp * 2.5:
-                        merged.append(x)
-                st.barlines_x = merged
-                staves[j].barlines_x = list(merged)
+    def _align_system_barlines(staves: List[_VecStaff], sys_groups: List[List[int]]):
+        for grp in sys_groups:
+            if len(grp) < 2:
+                continue
+            sp0 = staves[grp[0]].sp
+            combined = sorted(bx for idx in grp for bx in staves[idx].barlines_x)
+            merged: List[float] = []
+            for x in combined:
+                if not merged or (x - merged[-1]) >= sp0 * 2.5:
+                    merged.append(x)
+            for idx in grp:
+                staves[idx].barlines_x = list(merged)
 
     @staticmethod
     def _measure_edges(st: _VecStaff) -> List[float]:
@@ -589,6 +610,7 @@ class PDFVectorAnalyzer:
         ph: float,
         hand: str,
         system_index: int,
+        part_name: str = "",
     ) -> Tuple[MeasureInfo, List[NoteEvent]]:
         sp = st.sp
         m_info = MeasureInfo(
@@ -628,6 +650,7 @@ class PDFVectorAnalyzer:
                 clef=st.clef,
                 hand=hand,
                 system_index=system_index,
+                part_name=part_name,
             )
             m_info.notes.append(ne)
             return m_info, [ne]
@@ -752,6 +775,7 @@ class PDFVectorAnalyzer:
                 clef=st.clef,
                 hand=hand,
                 system_index=system_index,
+                part_name=part_name,
             )
             m_info.notes.append(ne)
             built_evs.append(ne)
