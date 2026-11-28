@@ -260,6 +260,43 @@ class TestGrandStaffAndSymbolicFormats(unittest.TestCase):
         self.assertAlmostEqual(staves[1].x_left, 50.0, delta=1.0)
         self.assertAlmostEqual(staves[1].x_right, 545.0, delta=1.0)
 
+    def test_playhead_monotonic_across_partial_rests_in_measure(self):
+        """驗證小節內含部分拍休止符（如四分休止 + 四分休止 + 二分音符）時，紅色游標嚴格由左向右按節拍前進、絕不來回跳動"""
+        xml_path = os.path.join(self.tmpdir.name, "partial_rests.musicxml")
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <note><rest/><duration>4</duration><type>quarter</type></note>
+      <note><rest/><duration>4</duration><type>quarter</type></note>
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>8</duration><type>half</type></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+        with open(xml_path, "w", encoding="utf-8") as f:
+            f.write(xml_content)
+
+        ui = AutoScrollPage()
+        self.assertTrue(ui.load_file(xml_path))
+        ui._is_playing = True
+        xs = []
+        for step in range(40):
+            ui._current_beat = step * 0.1
+            ui._sync_playhead_visual(scroll_to_staff=False)
+            cx = ui.score_view.page_labels[0]._cursor_x_norm
+            self.assertIsNotNone(cx)
+            xs.append(cx)
+        # 驗證整個小節內 cursor_x 嚴格單調遞增（絕不回彈！）
+        for a, b in zip(xs, xs[1:]):
+            self.assertGreaterEqual(b, a - 1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

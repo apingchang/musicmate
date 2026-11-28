@@ -1188,7 +1188,7 @@ class AutoScrollPage(QWidget):
 
     def _find_event_at_beat(self, beat: float) -> Tuple[int, NoteEvent]:
         events = self._analysis.events
-        # 找到最後一個 beat_offset <= beat + 1e-4 的事件，再優先挑同拍點內右手（或非休止）事件作主游標
+        # 找到最後一個 beat_offset <= beat + 1e-4 的事件，再於同一拍點內優先選取非休止音符（右手優先）作主游標
         lo, hi = 0, len(events) - 1
         best = 0
         while lo <= hi:
@@ -1198,14 +1198,20 @@ class AutoScrollPage(QWidget):
                 lo = mid + 1
             else:
                 hi = mid - 1
-        # 若為大譜表且同一拍點包含右手與左手，優先回傳該拍點的右手音符（讓紅線順暢跟隨右手旋律推進）
         target_b = events[best].beat_offset
-        cand = best
-        while cand > 0 and abs(events[cand - 1].beat_offset - target_b) <= 1e-3:
-            cand -= 1
-            if events[cand].hand != "LH" and not events[cand].is_rest:
-                return cand, events[cand]
-        return best, events[best]
+        group_start = best
+        while group_start > 0 and abs(events[group_start - 1].beat_offset - target_b) <= 1e-3:
+            group_start -= 1
+        # 優先級：右手實體音 > 左手實體音 > 右手休止 > 左手休止
+        chosen = best
+        best_rank = 99
+        for k_g in range(group_start, best + 1):
+            eg = events[k_g]
+            rank = (2 if eg.is_rest else 0) + (1 if eg.hand == "LH" else 0)
+            if rank < best_rank:
+                best_rank = rank
+                chosen = k_g
+        return chosen, events[chosen]
 
     def _sync_playhead_visual(self, scroll_to_staff: bool = True):
         """根據 _current_beat 計算游標位置、更新音符詳細校準面板，並於播放時雙手同步發聲"""
@@ -1223,43 +1229,51 @@ class AutoScrollPage(QWidget):
             else None
         )
 
-        frac = 0.0
-        if ev.duration_beats > 1e-6:
-            frac = max(0.0, min(1.0, (self._current_beat - ev.beat_offset) / ev.duration_beats))
+        # 查找當前小節範圍（供全小節休止與最後一音滑行至小節線用）
+        cur_m_obj = None
+        for m in staff.measures:
+            if m.measure_number == ev.measure_number:
+                cur_m_obj = m
+                break
 
         # 單音步進暫停狀態下，讓垂直光條精準對齊在該音符符頭正中央（便於校準比對！）
         if not self._is_playing:
             cursor_x = ev.x_norm
-        elif ev.is_rest:
-            start_x = ev.x_norm
-            end_x = staff.x_right_norm
-            for m in staff.measures:
-                if m.measure_number == ev.measure_number:
-                    start_x = m.x_start_norm
-                    end_x = m.x_end_norm
-                    break
+        elif ev.is_rest and (ev.rest_measures >= 1 or ev.notes_in_measure <= 1):
+            # 僅「整小節／多小節休止」才橫跨整小節均勻前進；部分拍休止符（如四分／八分休止）依節拍滑行至下一事件，絕不來回跳動！
+            start_x = cur_m_obj.x_start_norm if cur_m_obj is not None else ev.x_norm
+            end_x = cur_m_obj.x_end_norm if cur_m_obj is not None else staff.x_right_norm
+            span_b = max(1e-6, ev.duration_beats)
+            frac = max(0.0, min(1.0, (self._current_beat - ev.beat_offset) / span_b))
             cursor_x = start_x + (end_x - start_x) * frac
         else:
-            next_x = staff.x_right_norm
-            found_nxt = False
-            for j in range(idx + 1, min(len(events), idx + 12)):
+            # 尋找同一小節（或同行同遍）下一個起拍事件，依實際拍距 (nxt.beat_offset - ev.beat_offset) 嚴格由左至右單調插值！
+            next_x = cur_m_obj.x_end_norm if cur_m_obj is not None else staff.x_right_norm
+            span_b = (
+                max(1e-4, cur_m_obj.beat_end - ev.beat_offset)
+                if cur_m_obj is not None and cur_m_obj.beat_end > ev.beat_offset + 1e-4
+                else max(1e-4, ev.duration_beats)
+            )
+            valid_staves = {ev.staff_index}
+            if staff.paired_staff_index is not None:
+                valid_staves.add(staff.paired_staff_index)
+            for j in range(idx + 1, min(len(events), idx + 24)):
                 nxt = events[j]
                 if nxt.beat_offset <= ev.beat_offset + 1e-4:
                     continue
-                if (
-                    nxt.page_index == ev.page_index
-                    and nxt.staff_index == ev.staff_index
-                    and nxt.x_norm >= ev.x_norm - 1e-4
-                    and nxt.repeat_pass == ev.repeat_pass
-                ):
-                    next_x = nxt.x_norm
-                    found_nxt = True
-                break
-            if not found_nxt:
-                for m in staff.measures:
-                    if m.measure_number == ev.measure_number:
-                        next_x = m.x_end_norm
+                if nxt.page_index != ev.page_index or nxt.repeat_pass != ev.repeat_pass:
+                    break
+                if nxt.staff_index not in valid_staves:
+                    break
+                if nxt.measure_number == ev.measure_number:
+                    if nxt.x_norm >= ev.x_norm - 1e-4:
+                        next_x = nxt.x_norm
+                        span_b = max(1e-4, nxt.beat_offset - ev.beat_offset)
                         break
+                    continue
+                # 跨入同行下一小節時，本小節內先平滑推進到小節右界
+                break
+            frac = max(0.0, min(1.0, (self._current_beat - ev.beat_offset) / span_b))
             cursor_x = ev.x_norm + (next_x - ev.x_norm) * frac
 
         # 蒐集本拍點雙手同時發聲的所有音符座標（供大譜表同時雙手高亮光圈！）
